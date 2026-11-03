@@ -1,0 +1,21 @@
+
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "node1",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "node",
+      "args": [
+        "--node-id",
+        "n1",
+        "--port",
+        "7001",
+        "--log-level",
+        "DEBUG"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}
