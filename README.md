@@ -2,7 +2,7 @@
 
 A lightweight, self-healing distributed cache built from scratch in Python.
 
-SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, data storage, TTL expiration, replication, failure detection, and eventual consistency.
+SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, data storage, TTL expiration, consistent hashing, replication, failure detection, and eventual consistency.
 
 The project is being developed incrementally, starting with a working single-node cache and expanding toward a distributed, self-healing architecture.
 
@@ -18,7 +18,7 @@ The project is being developed incrementally, starting with a working single-nod
 
 ## Current Status
 
-**Phase 1 — Single-Node Cache**
+### Phase 1 — Single-Node Cache
 
 | Feature | Status |
 |---|---|
@@ -27,8 +27,19 @@ The project is being developed incrementally, starting with a working single-nod
 | Client connections | Implemented |
 | Key-value storage | Implemented |
 | TTL expiration | Implemented |
-| Unit and integration tests | In progress |
 | Initial performance benchmarking | Completed |
+
+### Phase 2 — Consistent Hashing
+
+| Feature | Status |
+|---|---|
+| Deterministic 64-bit hashing | Implemented |
+| Consistent hashing ring | Implemented |
+| Virtual nodes | Implemented |
+| Binary-search-based key lookup | Implemented |
+| Key movement experiments | Completed |
+| Vnode distribution experiments | Completed |
+| Performance measurements | Completed |
 
 Distributed replication, gossip-based failure detection, and anti-entropy synchronization are planned for subsequent phases.
 
@@ -39,6 +50,7 @@ Distributed replication, gossip-based failure detection, and anti-entropy synchr
 - RESP protocol
 - Pytest
 - Ruff
+- Matplotlib
 - Git and GitHub
 - WSL2 Ubuntu development environment
 
@@ -49,6 +61,7 @@ selfheal-cache/
 │
 ├── node/
 │   ├── __init__.py
+│   ├── ring.py
 │   └── ...
 │
 ├── client/
@@ -60,7 +73,8 @@ selfheal-cache/
 │   ├── conftest.py
 │   ├── test_resp.py
 │   ├── test_server.py
-│   └── test_store.py
+│   ├── test_store.py
+│   └── ...
 │
 ├── chaos/
 │
@@ -69,10 +83,13 @@ selfheal-cache/
 │
 ├── docs/
 │   ├── DESIGN.md
-│   └── BENCHMARKS.md
+│   ├── BENCHMARKS.md
+│   └── img/
+│       ├── key_movement.png
+│       ├── vnode_balance.png
+│       └── distribution.png
 │
 ├── .vscode/
-│
 ├── .gitignore
 ├── pyproject.toml
 └── README.md
@@ -110,7 +127,7 @@ source .venv/bin/activate
 Install the project and development dependencies:
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,analysis]"
 ```
 
 ### 4. Run the cache server
@@ -172,7 +189,50 @@ Environment: Windows laptop running Ubuntu 24.04 through WSL2, Python 3.12.
 
 These measurements establish the initial single-node performance baseline. Results may vary depending on hardware, system load, and environment.
 
-See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for details.
+### Phase 2 — Consistent Hashing Experiments
+
+The consistent hashing implementation was evaluated using 100,000 keys and varying numbers of physical and virtual nodes.
+
+#### 1. Key Movement
+
+The experiment compared modulo hashing against consistent hashing when adding one physical node.
+
+![Key movement](docs/img/key_movement.png)
+
+Consistent hashing moved approximately 33.8% of keys when increasing from two to three nodes, compared with 66.9% for modulo hashing.
+
+When increasing from ten to eleven nodes, the ring moved approximately 8.8% of keys, compared with 91.1% for modulo hashing.
+
+#### 2. Virtual Node Distribution
+
+The distribution experiment measured load imbalance across 10 physical nodes with different vnode counts.
+
+![Vnode balance](docs/img/vnode_balance.png)
+
+At 150 virtual nodes per physical node, the coefficient of variation was approximately 9.4%. Increasing to 500 vnodes reduced it to 5.5%, with additional construction overhead.
+
+The default configuration therefore uses 150 virtual nodes per physical node.
+
+#### 3. Key Distribution
+
+The following chart shows the distribution of 100,000 keys across five physical nodes using 150 virtual nodes per node.
+
+![Key distribution](docs/img/distribution.png)
+
+#### Phase 2 Performance
+
+| Metric | Result |
+|---|---:|
+| Physical nodes | 10 |
+| Virtual nodes per physical node | 150 |
+| Total virtual nodes | 1,500 |
+| Ring construction time | 9.3 ms |
+| Average lookup time | 1.48 μs |
+| Keys evaluated | 100,000 |
+
+The lookup measurement includes key hashing and ring lookup.
+
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for detailed measurements and methodology.
 
 ## Development
 
