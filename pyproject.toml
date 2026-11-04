@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "ruff"]
+analysis = ["matplotlib"]
 
 [tool.setuptools.packages.find]
 include = ["node*", "client*"]
