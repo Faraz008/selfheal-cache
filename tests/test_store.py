@@ -1,6 +1,6 @@
 import pytest
 
-from node.store import Store
+from node.store import Record, Store, VersionClock
 
 
 class FakeClock:
@@ -14,6 +14,10 @@ class FakeClock:
         self.t += ms
 
 
+def rec(value, ts, node="n1", exp=None):
+    return Record(value, (ts, node), exp)
+
+
 @pytest.fixture
 def clock():
     return FakeClock()
@@ -21,55 +25,34 @@ def clock():
 
 @pytest.fixture
 def store(clock):
-    return Store(clock=clock)
+    return Store(clock=clock, grace_ms=1000)
 
 
-def test_set_get_missing(store):
-    store.set(b"a", b"1")
-    assert store.get(b"a") == b"1"
-    assert store.get(b"nope") is None
+def test_apply_and_get_live(store):
+    assert store.apply(b"a", rec(b"1", 10)) is True
+    assert store.get_live(b"a").value == b"1"
+    assert store.get_live(b"nope") is None
+    assert len(store) == 1
 
 
 def test_lazy_expiry_boundary(store, clock):
-    store.set(b"a", b"1", expire_at_ms=clock() + 1000)
+    t = clock()
+    store.apply(b"a", rec(b"1", t, exp=t + 1000))
     clock.advance(999)
-    assert store.get(b"a") == b"1"
+    assert store.get_live(b"a") is not None
     clock.advance(1)
-    assert store.get(b"a") is None
+    assert store.get_live(b"a") is None
     assert len(store) == 0
+    assert store.raw_len() == 1  # invisible, but kept so old versions can't resurrect it
 
 
-def test_plain_set_clears_ttl(store, clock):
-    store.set(b"a", b"1", clock() + 1000)
-    store.set(b"a", b"2")
-    assert store.ttl_ms(b"a") == -1
-
-
-def test_ttl_codes(store, clock):
-    assert store.ttl_ms(b"x") == -2
-    store.set(b"a", b"1")
-    assert store.ttl_ms(b"a") == -1
-    store.set_expire_at(b"a", clock() + 500)
-    assert store.ttl_ms(b"a") == 500
-
-
-def test_persist(store, clock):
-    store.set(b"a", b"1", clock() + 500)
-    assert store.persist(b"a") is True
-    assert store.persist(b"a") is False
-    clock.advance(10_000)
-    assert store.get(b"a") == b"1"
-
-
-def test_delete(store):
-    store.set(b"a", b"1")
-    assert store.delete(b"a") is True
-    assert store.delete(b"a") is False
-
-
-def test_sweep_removes_expired_without_reads(store, clock):
+def test_sweep_collects_only_after_grace(store, clock):
+    t = clock()
     for i in range(100):
-        store.set(f"k{i}".encode(), b"v", clock() + 10)
-    clock.advance(11)
+        store.apply(f"k{i}".encode(), rec(b"v", t, exp=t + 100))
+    clock.advance(500)  # expired, still inside the 1000 ms grace
     store.sweep()
-    assert len(store) == 0
+    assert store.raw_len() == 100
+    clock.advance(700)  # now past expire_at + grace
+    store.sweep()
+    assert store.raw_len() == 0

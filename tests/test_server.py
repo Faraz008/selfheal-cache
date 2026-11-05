@@ -3,8 +3,10 @@ import asyncio
 import pytest
 
 from node import resp
+from node.config import NodeConfig
+from node.server import Server
 
-from .conftest import ServerError
+from .conftest import ServerError, connect
 
 
 async def test_ping(client):
@@ -62,10 +64,17 @@ async def test_pipelining(client):
     assert await client.read_reply() == b"1"
 
 
-async def test_sweeper_without_reads(server, client):
-    await client.cmd("SET", "a", "1", "PX", 30)
-    await asyncio.sleep(0.3)
-    assert len(server.store) == 0  # gone without anyone reading it
+async def test_sweeper_collects_without_reads():
+    s = Server(NodeConfig(port=0, rpc_port=0, sweep_interval_ms=20, tombstone_grace_ms=0))
+    await s.start()
+    c = await connect(s.port)
+    try:
+        await c.cmd("SET", "a", "1", "PX", 30)
+        await asyncio.sleep(0.3)
+        assert s.store.raw_len() == 0  # physically gone, nobody read it
+    finally:
+        c.w.close()
+        await s.stop()
 
 
 async def test_large_value(client):

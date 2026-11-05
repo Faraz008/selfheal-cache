@@ -54,6 +54,11 @@ Nodes will eventually use distributed failure detection and anti-entropy mechani
 
 *This document describes the intended system design. Features are implemented incrementally; the current single-node implementation does not yet provide all distributed guarantees described above.*
 
+
 Token names are "{node_id}#{i}". Node IDs must therefore be stable and unique across restarts. If a node restarts with a new ID, it owns different ranges and everything reshuffles. Use IDs like n1, n2, never random UUIDs per boot.
 
 _rebuild is O(V log V) and runs only on membership change (rare), never per request. Lookups are O(log V) via binary search.
+
+SET NX/XX, EXPIRE and PERSIST are non-atomic in a leaderless cluster (read-then-write).
+
+**Tombstone Grace Period:** `tombstone_grace_ms` (default: 10 minutes) must exceed the maximum replica downtime tolerated without a full resync and, once implemented at a later phase, the hint TTL. Longer grace periods improve protection against stale data resurrection but increase memory usage because expired records remain stored until garbage collection.

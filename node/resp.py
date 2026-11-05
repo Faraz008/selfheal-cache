@@ -74,3 +74,8 @@ def encode_command(*parts) -> bytes:
             p = str(p).encode()
         out.append(b"$%d\r\n%s\r\n" % (len(p), p))
     return b"".join(out)
+
+
+def array(items: list[bytes]) -> bytes:
+    """items are already-encoded RESP elements."""
+    return b"*%d\r\n%s" % (len(items), b"".join(items))

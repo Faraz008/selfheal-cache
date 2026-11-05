@@ -3,6 +3,7 @@ import logging
 
 from . import resp
 from .config import NodeConfig
+from .coordinator import ClusterError, Coordinator
 from .store import Store
 
 log = logging.getLogger("node")
@@ -21,8 +22,10 @@ def parse_int(raw: bytes) -> int:
 
 class Server:
     def __init__(self, cfg: NodeConfig, store: Store | None = None):
+        cfg.validate()
         self.cfg = cfg
-        self.store = store or Store()
+        self.store = store if store is not None else Store(grace_ms=cfg.tombstone_grace_ms)
+        self.coord = Coordinator(cfg, self.store)
         self._server: asyncio.Server | None = None
         self._sweeper: asyncio.Task | None = None
         self._writers: set[asyncio.StreamWriter] = set()
@@ -39,14 +42,23 @@ class Server:
             "PTTL": (self.cmd_pttl, 1, 1),
             "PERSIST": (self.cmd_persist, 1, 1),
             "DBSIZE": (self.cmd_dbsize, 0, 0),
-            "COMMAND": (self.cmd_command, 0, None),  # redis-cli sends this on connect
+            "COMMAND": (self.cmd_command, 0, None),
+            # debug commands (not in Redis)
+            "WHERE": (self.cmd_where, 1, 1),  # preference list for a key
+            "LOCALGET": (self.cmd_localget, 1, 1),  # read THIS node's store only
         }
 
     # ---- lifecycle ----
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle, self.cfg.host, self.cfg.port)
         self._sweeper = asyncio.create_task(self._sweep_loop())
-        log.info("listening on %s:%d", self.cfg.host, self.port)
+        log.info(
+            "client port %d, members=%s N=%d W=%d",
+            self.port,
+            sorted(self.coord.members),
+            self.cfg.replicas,
+            self.cfg.write_acks,
+        )
 
     @property
     def port(self) -> int:
@@ -68,7 +80,7 @@ class Server:
             await asyncio.sleep(interval)
             removed = self.store.sweep()
             if removed:
-                log.debug("sweeper removed %d keys", removed)
+                log.debug("sweeper collected %d records", removed)
 
     # ---- connection handling ----
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -85,7 +97,7 @@ class Server:
                     break
                 if not args:
                     continue
-                writer.write(self.execute(args))
+                writer.write(await self.execute(args))
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
@@ -93,7 +105,7 @@ class Server:
             self._writers.discard(writer)
             writer.close()
 
-    def execute(self, args: list[bytes]) -> bytes:
+    async def execute(self, args: list[bytes]) -> bytes:
         name = args[0].upper().decode("utf-8", "replace")
         entry = self._table.get(name)
         if entry is None:
@@ -103,21 +115,24 @@ class Server:
         if n < lo or (hi is not None and n > hi):
             return resp.error(f"ERR wrong number of arguments for '{name.lower()}' command")
         try:
-            return fn(args[1:])
+            return await fn(args[1:])
         except CommandError as e:
             return resp.error(str(e))
+        except ClusterError as e:
+            return resp.error(f"CLUSTERDOWN {e}")
 
     # ---- commands ----
-    def cmd_ping(self, a):
+    async def cmd_ping(self, a):
         return resp.bulk(a[0]) if a else resp.PONG
 
-    def cmd_command(self, a):
+    async def cmd_command(self, a):
         return b"*0\r\n"
 
-    def cmd_get(self, a):
-        return resp.bulk(self.store.get(a[0]))
+    async def cmd_get(self, a):
+        rec = await self.coord.read(a[0])
+        return resp.bulk(rec.value if rec else None)
 
-    def cmd_set(self, a):
+    async def cmd_set(self, a):
         key, val = a[0], a[1]
         expire_at, nx, xx = None, False, False
         i = 2
@@ -129,7 +144,8 @@ class Server:
                 n = parse_int(a[i + 1])
                 if n <= 0:
                     raise CommandError("ERR invalid expire time in 'set' command")
-                expire_at = self.store.now() + (n * 1000 if opt == b"EX" else n)
+                # computed ONCE, here, as an absolute timestamp
+                expire_at = self.coord.now() + (n * 1000 if opt == b"EX" else n)
                 i += 2
             elif opt == b"NX":
                 nx, i = True, i + 1
@@ -139,37 +155,69 @@ class Server:
                 raise CommandError("ERR syntax error")
         if nx and xx:
             raise CommandError("ERR syntax error")
-        exists = self.store.get(key) is not None
-        if (nx and exists) or (xx and not exists):
-            return resp.NIL
-        self.store.set(key, val, expire_at)
+        if nx or xx:  # best-effort in a leaderless cluster: NOT atomic
+            exists = await self.coord.read(key) is not None
+            if (nx and exists) or (xx and not exists):
+                return resp.NIL
+        await self.coord.set(key, val, expire_at)
         return resp.OK
 
-    def cmd_del(self, a):
-        return resp.integer(sum(self.store.delete(k) for k in a))
+    async def cmd_del(self, a):
+        n = 0
+        for k in a:
+            if await self.coord.read(k) is not None:
+                n += 1
+            await self.coord.delete(k)  # always write the tombstone
+        return resp.integer(n)
 
-    def cmd_exists(self, a):
-        return resp.integer(sum(self.store.get(k) is not None for k in a))
+    async def cmd_exists(self, a):
+        n = 0
+        for k in a:
+            n += await self.coord.read(k) is not None
+        return resp.integer(n)
 
-    def _expire(self, a, mult):
+    async def _expire(self, a, mult):
         n = parse_int(a[1])
-        return resp.integer(int(self.store.set_expire_at(a[0], self.store.now() + n * mult)))
+        rec = await self.coord.read(a[0])
+        if rec is None:
+            return resp.integer(0)
+        await self.coord.set(a[0], rec.value, self.coord.now() + n * mult)
+        return resp.integer(1)
 
-    def cmd_expire(self, a):
-        return self._expire(a, 1000)
+    async def cmd_expire(self, a):
+        return await self._expire(a, 1000)
 
-    def cmd_pexpire(self, a):
-        return self._expire(a, 1)
+    async def cmd_pexpire(self, a):
+        return await self._expire(a, 1)
 
-    def cmd_pttl(self, a):
-        return resp.integer(self.store.ttl_ms(a[0]))
+    async def _ttl_ms(self, key: bytes) -> int:
+        rec = await self.coord.read(key)
+        if rec is None:
+            return -2
+        if rec.expire_at is None:
+            return -1
+        return max(0, rec.expire_at - self.coord.now())
 
-    def cmd_ttl(self, a):
-        ms = self.store.ttl_ms(a[0])
+    async def cmd_pttl(self, a):
+        return resp.integer(await self._ttl_ms(a[0]))
+
+    async def cmd_ttl(self, a):
+        ms = await self._ttl_ms(a[0])
         return resp.integer(ms if ms < 0 else (ms + 500) // 1000)
 
-    def cmd_persist(self, a):
-        return resp.integer(int(self.store.persist(a[0])))
+    async def cmd_persist(self, a):
+        rec = await self.coord.read(a[0])
+        if rec is None or rec.expire_at is None:
+            return resp.integer(0)
+        await self.coord.set(a[0], rec.value, None)
+        return resp.integer(1)
 
-    def cmd_dbsize(self, a):
-        return resp.integer(len(self.store))
+    async def cmd_dbsize(self, a):
+        return resp.integer(len(self.store))  # THIS node only
+
+    async def cmd_where(self, a):
+        return resp.array([resp.bulk(n.encode()) for n in self.coord.preference_list(a[0])])
+
+    async def cmd_localget(self, a):
+        rec = self.store.get_live(a[0])
+        return resp.bulk(rec.value if rec else None)

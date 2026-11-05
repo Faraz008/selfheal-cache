@@ -1,4 +1,6 @@
 import asyncio
+import socket
+import time
 
 import pytest
 
@@ -38,9 +40,30 @@ class Client:
         return await self.read_reply()
 
 
+async def connect(port: int) -> Client:
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    return Client(r, w)
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+async def eventually(cond, timeout: float = 3.0) -> None:
+    """Poll an async predicate. Eventual consistency needs a deadline, not a sleep."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if await cond():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not met in time")
+
+
 @pytest.fixture
 async def server():
-    s = Server(NodeConfig(port=0, sweep_interval_ms=20))
+    s = Server(NodeConfig(port=0, rpc_port=0, sweep_interval_ms=20))
     await s.start()
     yield s
     await s.stop()
@@ -48,6 +71,6 @@ async def server():
 
 @pytest.fixture
 async def client(server):
-    r, w = await asyncio.open_connection("127.0.0.1", server.port)
-    yield Client(r, w)
-    w.close()
+    c = await connect(server.port)
+    yield c
+    c.w.close()
