@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from node.config import NodeConfig
@@ -94,3 +96,43 @@ async def test_write_fails_cleanly_when_acks_unreachable(make):
     await servers[2].stop()
     with pytest.raises(ServerError, match="CLUSTERDOWN"):
         await c1.cmd("SET", key, "v")
+
+
+async def test_delete_replicates_as_tombstone(make):
+    servers = await make(3, replicas=2, write_acks=2)
+    c0, c1, c2 = [await connect(s.port) for s in servers]
+    await c0.cmd("SET", "k", "v")
+    assert await c1.cmd("DEL", "k") == 1
+    for c in (c0, c1, c2):
+        assert await c.cmd("GET", "k") is None
+    for s in servers:
+        if s.cfg.node_id in servers[0].coord.preference_list(b"k"):
+            assert s.store.get_record(b"k").is_tombstone
+
+
+async def test_concurrent_writes_converge_to_one_value(make):
+    servers = await make(3, replicas=3, write_acks=3)
+    clients = [await connect(s.port) for s in servers]
+    for rnd in range(20):
+        key = f"k{rnd}"
+        await asyncio.gather(*(c.cmd("SET", key, f"from-{i}") for i, c in enumerate(clients)))
+        values = {s.store.get_live(key.encode()).value for s in servers}
+        assert len(values) == 1, values  # all replicas picked the same winner
+
+
+async def test_ttl_is_one_absolute_timestamp_on_every_replica(make):
+    servers = await make(3, replicas=3, write_acks=3)
+    c = await connect(servers[0].port)
+    await c.cmd("SET", "k", "v", "EX", 100)
+    stamps = {s.store.get_record(b"k").expire_at for s in servers}
+    assert len(stamps) == 1 and None not in stamps  # Phase 7 groundwork, free
+
+
+async def test_overwrite_after_delete_wins(make):
+    servers = await make(3, replicas=3, write_acks=3)
+    c0, c1, _ = [await connect(s.port) for s in servers]
+    await c0.cmd("SET", "k", "1")
+    await c1.cmd("DEL", "k")
+    await c0.cmd("SET", "k", "2")
+    for s in servers:
+        assert s.store.get_live(b"k").value == b"2"

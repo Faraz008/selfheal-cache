@@ -56,3 +56,71 @@ def test_sweep_collects_only_after_grace(store, clock):
     clock.advance(700)  # now past expire_at + grace
     store.sweep()
     assert store.raw_len() == 0
+
+
+def test_newer_version_wins_regardless_of_arrival_order(store):
+    store.apply(b"a", rec(b"new", 20))
+    assert store.apply(b"a", rec(b"old", 10)) is False
+    assert store.get_live(b"a").value == b"new"
+
+
+def test_equal_version_is_idempotent(store):
+    assert store.apply(b"a", rec(b"1", 10)) is True
+    assert store.apply(b"a", rec(b"1", 10)) is False  # a retried replication is harmless
+
+
+def test_timestamp_tie_broken_by_node_id(clock):
+    s1, s2 = Store(clock=clock), Store(clock=clock)
+    s1.apply(b"a", rec(b"from-n1", 10, "n1"))
+    s1.apply(b"a", rec(b"from-n2", 10, "n2"))
+    s2.apply(b"a", rec(b"from-n2", 10, "n2"))
+    s2.apply(b"a", rec(b"from-n1", 10, "n1"))
+    assert s1.get_live(b"a").value == s2.get_live(b"a").value == b"from-n2"
+
+
+def test_tombstone_blocks_resurrection(store, clock):
+    store.apply(b"a", rec(b"1", 10))
+    store.apply(b"a", Record(None, (20, "n1"), clock()))
+    assert store.get_live(b"a") is None
+    assert store.apply(b"a", rec(b"1", 10)) is False  # stale replica pushes the old value
+    assert store.get_live(b"a") is None
+    assert store.apply(b"a", rec(b"2", 30)) is True  # a genuinely newer write wins
+    assert store.get_live(b"a").value == b"2"
+
+
+def test_expired_value_also_blocks_resurrection(store, clock):
+    t = clock()
+    store.apply(b"a", rec(b"new", t, exp=t + 100))
+    clock.advance(200)
+    assert store.get_live(b"a") is None
+    assert store.apply(b"a", rec(b"old", t - 50)) is False
+
+
+def test_tombstone_collected_after_grace(store, clock):
+    t = clock()
+    store.apply(b"a", Record(None, (t, "n1"), t))
+    store.sweep()
+    assert store.raw_len() == 1
+    clock.advance(1000)
+    store.sweep()
+    assert store.raw_len() == 0
+
+
+def test_already_collectable_record_clears_older_value(store, clock):
+    t = clock()
+    store.apply(b"a", rec(b"1", 10))
+    assert store.apply(b"a", Record(None, (20, "n1"), t - 5000)) is False
+    assert store.get_live(b"a") is None
+    assert store.raw_len() == 0
+
+
+def test_version_clock_strictly_increasing_in_same_ms():
+    vc = VersionClock("n1", lambda: 5)
+    assert [vc.next() for _ in range(3)] == [(5, "n1"), (6, "n1"), (7, "n1")]
+
+
+def test_version_clock_follows_wall_clock(clock):
+    vc = VersionClock("n1", clock)
+    a = vc.next()
+    clock.advance(100)
+    assert vc.next()[0] - a[0] == 100
