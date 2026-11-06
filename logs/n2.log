@@ -1,2 +1,8 @@
-2026-11-05 07:11:31,152 INFO node=n2 client port 7002, RPC port 8002, members=['n1', 'n2', 'n3'] N=2 W=1
-2026-11-05 07:13:03,919 INFO node=n2 stopped
+2026-11-06 09:37:03,962 INFO node=n2 member n2 -> alive (inc 1793957823961)
+2026-11-06 09:37:03,962 INFO node=n2 member n1 -> alive (inc 0)
+2026-11-06 09:37:03,962 INFO node=n2 member n3 -> alive (inc 0)
+2026-11-06 09:37:03,963 INFO node=n2 ring rebuilt: ['n1', 'n2', 'n3']
+2026-11-06 09:37:03,964 INFO node=n2 client port 7002, RPC port 8002, members=['n1', 'n2', 'n3'] N=2 W=1
+2026-11-06 09:37:04,886 INFO node=n2 member n3 -> alive (inc 1793957823961)
+2026-11-06 09:37:04,986 INFO node=n2 member n1 -> alive (inc 1793957823959)
+2026-11-06 09:41:08,738 INFO node=n2 stopped

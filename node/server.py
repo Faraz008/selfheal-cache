@@ -4,7 +4,9 @@ import logging
 from . import resp
 from .config import NodeConfig
 from .coordinator import ClusterError, Coordinator
-from .rpc import RpcServer
+from .gossip import Gossiper
+from .membership import Membership
+from .rpc import Peers, RpcServer
 from .store import Store
 
 log = logging.getLogger("node")
@@ -28,14 +30,37 @@ class Server:
         self.cfg = cfg
         self.store = store if store is not None else Store(grace_ms=cfg.tombstone_grace_ms)
 
-        self.coord = Coordinator(cfg, self.store)
+        # ---- membership and cluster communication ----
+
+        self.membership = Membership.from_config(cfg, self.store.now)
+
+        self.peers = Peers(timeout_s=cfg.rpc_timeout_ms / 1000)
+
+        self.coord = Coordinator(
+            cfg,
+            self.store,
+            self.membership,
+            self.peers,
+        )
+
+        self.gossip = Gossiper(
+            cfg,
+            self.membership,
+            self.peers,
+        )
 
         # Internal RPC server for communication between cluster nodes.
+        # Coordinator and gossip handlers share the same RPC server.
         self.rpc = RpcServer(
             cfg.host,
             cfg.rpc_port,
-            self.coord.handlers(),
+            {
+                **self.coord.handlers(),
+                **self.gossip.handlers(),
+            },
         )
+
+        # ---- client-facing server lifecycle ----
 
         self._server: asyncio.Server | None = None
         self._sweeper: asyncio.Task | None = None
@@ -55,6 +80,8 @@ class Server:
             "PERSIST": (self.cmd_persist, 1, 1),
             "DBSIZE": (self.cmd_dbsize, 0, 0),
             "COMMAND": (self.cmd_command, 0, None),
+            # Membership inspection command.
+            "CLUSTER": (self.cmd_cluster, 1, 1),
             # Debug commands (not part of Redis).
             "WHERE": (self.cmd_where, 1, 1),
             "LOCALGET": (self.cmd_localget, 1, 1),
@@ -65,6 +92,9 @@ class Server:
     async def start(self) -> None:
         # Start internal RPC first so peers can reach this node.
         await self.rpc.start()
+
+        # Start membership gossip after RPC is available.
+        await self.gossip.start()
 
         # Start the client-facing RESP server.
         self._server = await asyncio.start_server(
@@ -79,7 +109,7 @@ class Server:
             "client port %d, RPC port %d, members=%s N=%d W=%d",
             self.port,
             self.rpc.port,
-            sorted(self.coord.members),
+            self.membership.node_ids(),
             self.cfg.replicas,
             self.cfg.write_acks,
         )
@@ -92,13 +122,18 @@ class Server:
         return self._server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
+        # Stop gossip before shutting down internal RPC.
+        await self.gossip.stop()
+
         # Stop the background sweeper.
         if self._sweeper:
             self._sweeper.cancel()
+
             try:
                 await self._sweeper
             except asyncio.CancelledError:
                 pass
+
             self._sweeper = None
 
         # Stop accepting client connections.
@@ -111,9 +146,12 @@ class Server:
             await self._server.wait_closed()
             self._server = None
 
-        # Stop internal RPC and close peer connections.
+        # Stop internal RPC.
         await self.rpc.stop()
+
+        # Close coordinator and peer connections.
         await self.coord.close()
+        await self.peers.close()
 
         log.info("stopped")
 
@@ -196,6 +234,22 @@ class Server:
 
     async def cmd_command(self, a):
         return b"*0\r\n"
+
+    async def cmd_cluster(self, a):
+        if a[0].upper() != b"NODES":
+            raise CommandError("ERR unknown CLUSTER subcommand")
+
+        lines = [
+            f"{e.node_id} {e.host}:{e.port} "
+            f"{e.state.value} {e.incarnation}"
+            + (" myself" if e.node_id == self.cfg.node_id else "")
+            for e in sorted(
+                self.membership.entries(),
+                key=lambda e: e.node_id,
+            )
+        ]
+
+        return resp.bulk(("\n".join(lines) + "\n").encode())
 
     async def cmd_get(self, a):
         rec = await self.coord.read(a[0])

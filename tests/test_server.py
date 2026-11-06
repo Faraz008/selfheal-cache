@@ -81,3 +81,8 @@ async def test_large_value(client):
     big = b"x" * 1_000_000
     await client.cmd("SET", "big", big)
     assert await client.cmd("GET", "big") == big
+
+
+async def test_cluster_nodes_command(client):
+    out = await client.cmd("CLUSTER", "NODES")
+    assert b"myself" in out and b"alive" in out

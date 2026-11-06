@@ -3,6 +3,7 @@ import base64
 import logging
 
 from .config import NodeConfig
+from .membership import Entry, Membership
 from .ring import Ring
 from .rpc import Peers, RpcError
 from .store import Record, Store, VersionClock
@@ -36,22 +37,25 @@ def rec_from_wire(d: dict) -> Record:
 
 
 class Coordinator:
-    def __init__(self, cfg: NodeConfig, store: Store):
-        self.cfg, self.store = cfg, store
+    def __init__(self, cfg: NodeConfig, store: Store, membership: Membership, peers: Peers):
+        self.cfg, self.store, self.m, self.peers = cfg, store, membership, peers
         self.id = cfg.node_id
-        self.members = {m.node_id: m for m in cfg.member_list()}
         self.ring = Ring(cfg.vnodes)
-        self.ring.set_nodes(self.members)
         self.versions = VersionClock(self.id, store.now)
-        self.peers = Peers(
-            {
-                m.node_id: (m.host, m.rpc_port)
-                for m in self.members.values()
-                if m.node_id != self.id
-            },
-            timeout_s=cfg.rpc_timeout_ms / 1000,
-        )
         self._bg: set[asyncio.Task] = set()
+        self.m.subscribe(self._on_membership)
+        self._on_membership(self.m.entries())  # initial sync
+
+    def _on_membership(self, changed: list[Entry]) -> None:
+        for e in changed:
+            log.info("member %s -> %s (inc %d)", e.node_id, e.state.value, e.incarnation)
+            if e.node_id != self.id:
+                self.peers.set_addr(e.node_id, e.host, e.rpc_port)
+        ids = self.m.node_ids()
+        # Ring membership == "ever seen and not removed". Liveness is NOT part of it.
+        if ids != self.ring.nodes:
+            self.ring.set_nodes(ids)
+            log.info("ring rebuilt: %s", ids)
 
     # ---- helpers ----
     def now(self) -> int:
@@ -63,14 +67,10 @@ class Coordinator:
     async def close(self) -> None:
         for t in list(self._bg):
             t.cancel()
-        await self.peers.close()
 
     # ---- RPC handlers (this node acting as a REPLICA) ----
     def handlers(self):
-        return {"ping": self._rpc_ping, "put": self._rpc_put, "get": self._rpc_get}
-
-    async def _rpc_ping(self, a):
-        return "pong"
+        return {"put": self._rpc_put, "get": self._rpc_get}
 
     async def _rpc_put(self, a):
         return self.store.apply(b64d(a["k"]), rec_from_wire(a["r"]))
@@ -85,7 +85,7 @@ class Coordinator:
 
     async def delete(self, key: bytes) -> None:
         v = self.versions.next()
-        await self._replicate(key, Record(None, v, v[0]))  # tombstone: delete == expire now
+        await self._replicate(key, Record(None, v, v[0]))  # tombstone
 
     async def read(self, key: bytes) -> Record | None:
         """Live record or None. First replica that answers wins."""
@@ -100,7 +100,7 @@ class Coordinator:
             except RpcError as e:
                 log.warning("read from %s failed: %s", nid, e)
                 last_err = e
-                continue  # fail over to the next replica
+                continue
             return rec if rec is not None and rec.is_live(self.now()) else None
         raise ClusterError("no replica reachable") from last_err
 
@@ -121,7 +121,7 @@ class Coordinator:
         tasks = []
         for nid in targets:
             t = asyncio.create_task(self._put(nid, key, rec))
-            self._bg.add(t)  # keeps stragglers alive after we return
+            self._bg.add(t)
             t.add_done_callback(self._bg.discard)
             tasks.append(t)
         pending, acks = set(tasks), 0

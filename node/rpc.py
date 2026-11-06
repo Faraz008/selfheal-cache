@@ -177,10 +177,24 @@ class RpcClient:
 
 
 class Peers:
-    """node_id -> RpcClient. Phase 4 will make this dynamic."""
+    """node_id -> RpcClient. Addresses come from the membership table."""
 
-    def __init__(self, addrs: dict[str, tuple[str, int]], timeout_s: float = 0.5):
-        self._clients = {nid: RpcClient(h, p, timeout_s) for nid, (h, p) in addrs.items()}
+    def __init__(self, addrs: dict[str, tuple[str, int]] | None = None, timeout_s: float = 0.5):
+        self._timeout = timeout_s
+        self._clients: dict[str, RpcClient] = {}
+        self._bg: set[asyncio.Task] = set()
+        for nid, (h, p) in (addrs or {}).items():
+            self.set_addr(nid, h, p)
+
+    def set_addr(self, node_id: str, host: str, port: int) -> None:
+        cur = self._clients.get(node_id)
+        if cur is not None and (cur.host, cur.port) == (host, port):
+            return
+        if cur is not None:  # node came back on a new address
+            t = asyncio.create_task(cur.close())
+            self._bg.add(t)
+            t.add_done_callback(self._bg.discard)
+        self._clients[node_id] = RpcClient(host, port, self._timeout)
 
     async def call(self, node_id: str, op: str, args: dict | None = None, timeout=None):
         client = self._clients.get(node_id)
@@ -190,3 +204,4 @@ class Peers:
 
     async def close(self) -> None:
         await asyncio.gather(*(c.close() for c in self._clients.values()))
+        await asyncio.gather(*self._bg, return_exceptions=True)

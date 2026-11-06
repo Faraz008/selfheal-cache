@@ -111,8 +111,8 @@ class NodeConfig:
         for member in members:
             if (
                 not member.host
-                or not 1 <= member.port <= 65535
-                or not 1 <= member.rpc_port <= 65535
+                or not 0 <= member.port <= 65535
+                or not 0 <= member.rpc_port <= 65535
             ):
                 raise SystemExit(f"invalid endpoint for member {member.node_id}")
 
