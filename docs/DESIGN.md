@@ -60,7 +60,7 @@ Token names are "{node_id}#{i}". Node IDs must therefore be stable and unique ac
 _rebuild is O(V log V) and runs only on membership change (rare), never per request. Lookups are O(log V) via binary search.
 
 
-## Replication and Versioning
+## 6. Replication and Versioning
 
 ### Last-Write-Wins (LWW)
 
@@ -122,3 +122,188 @@ The following operations use a read-then-write sequence and are not atomic in th
 - `PERSIST`: reads the existing value before writing a version without expiration.
 
 Concurrent coordinators can interleave these operations, so their conditions are best-effort rather than strongly consistent.
+
+## 7. Membership & Failure Detection
+
+### Membership Table
+
+Each node maintains a local membership table containing the nodes it knows about. The membership table is a pure data structure with no networking or I/O dependencies. Its operations are deterministic and independently testable using a fake clock.
+
+Each membership entry contains:
+
+`(node_id, host, port, rpc_port, state, incarnation)`
+
+- `node_id`: Stable and unique identifier for the node.
+- `host`: Advertised address used by other nodes to reach it.
+- `port`: Client-facing RESP port.
+- `rpc_port`: Internal node-to-node communication port.
+- `state`: Current membership state.
+- `incarnation`: Version number identifying the node's current membership generation.
+
+Node IDs must remain stable and unique across restarts. IDs such as `n1` and `n2` are used instead of generating a new random ID on every boot. Changing a node ID makes it a different ring member and changes key ownership.
+
+### Membership States
+
+Nodes can have one of five membership states, ordered by increasing severity:
+
+`JOINING < ALIVE < SUSPECT < LEAVING < DEAD`
+
+- **JOINING:** A newly discovered node that has not completed cluster activation.
+- **ALIVE:** A node currently considered healthy and available.
+- **SUSPECT:** A node that has failed direct and indirect probing and may be unavailable.
+- **LEAVING:** A node preparing to leave the cluster. Reserved for Phase 6.
+- **DEAD:** A node confirmed unavailable after its suspicion timeout expires.
+
+The state ordering is also used when resolving membership updates with equal incarnation numbers.
+
+### Membership Merge Rules
+
+Membership updates are merged using incarnation numbers and state rank.
+
+A remote entry supersedes the local entry if:
+
+1. Its incarnation number is higher than the local entry's incarnation; or
+2. Both entries have the same incarnation, but the remote entry has a higher-ranked state.
+
+The winning entry is therefore the maximum under the ordering:
+
+`(incarnation, state_rank)`
+
+This makes the merge operation commutative, associative, and idempotent. Gossip messages can arrive out of order or be duplicated without preventing membership convergence.
+
+Node endpoint metadata (`host`, `port`, and `rpc_port`) is treated as immutable for a given node ID. Conflicting endpoint metadata for an existing node ID is rejected rather than silently merged.
+
+### Incarnation Numbers and Refutation
+
+Each node initializes its incarnation number using its boot-time Unix timestamp in milliseconds.
+
+Incarnation numbers distinguish different generations of a node and allow a restarted node to supersede stale membership information from its previous lifetime.
+
+When a node receives a SUSPECT or DEAD claim about itself with an incarnation greater than or equal to its current incarnation, it refutes the accusation by:
+
+1. Setting its incarnation to the claimed incarnation plus one.
+2. Setting its state to ALIVE, unless it is still JOINING.
+3. Disseminating the updated membership entry through gossip.
+
+The higher incarnation ensures that the refutation supersedes the older accusation across the cluster.
+
+The node itself is the authority on its own membership state. Remote membership updates about the local node are never directly adopted; they are processed through the refutation mechanism.
+
+**Restart assumption:** Boot-time incarnation numbers assume the wall clock does not move backwards across restarts. A manual clock rewind or a restart after an incarnation has been increased substantially through refutation can cause a new incarnation to be lower than an older one. Incarnation persistence is not implemented in the current design.
+
+### Failure Detection: SWIM-Style Probing
+
+Failure detection uses periodic direct and indirect probing rather than relying on heartbeat counters.
+
+Each node periodically selects another known node and sends a direct liveness probe through the internal RPC interface.
+
+The probing process is:
+
+1. The probing node sends a direct ping to the target.
+2. If the target does not respond within `probe_timeout_ms`, the probing node selects helper nodes.
+3. The helpers attempt indirect probes to the target.
+4. If all direct and indirect probes fail, the target is marked SUSPECT.
+5. A local suspicion timer starts. If the timer expires without a successful refutation or newer membership update, the target is marked DEAD.
+
+The default configuration uses two indirect probes.
+
+Indirect probes happen before declaring SUSPECT, reducing false suspicions caused by a failed network path between two particular nodes.
+
+A SUSPECT node can refute the accusation by increasing its incarnation number and publishing an ALIVE entry.
+
+### Suspicion Timers
+
+Suspicion timers are local to each node and are never included in gossip messages.
+
+Each node starts its own monotonic-clock timer when it first accepts a new SUSPECT entry. Repeated gossip of the same suspicion does not restart the timer.
+
+When the timer expires, the node creates a DEAD entry using the suspected node's existing incarnation number.
+
+Every node that independently expires the same suspicion therefore derives the same `(incarnation, DEAD)` membership entry.
+
+Nodes may temporarily disagree about when a target becomes DEAD because they may learn about the suspicion at different times. Once a DEAD entry is propagated, the membership merge rules ensure that it supersedes the corresponding SUSPECT entry.
+
+A newer ALIVE entry with a higher incarnation cancels the local suspicion timer.
+
+### Gossip and Membership Dissemination
+
+Nodes exchange membership information using periodic full-table push-pull gossip.
+
+During a gossip exchange, nodes send their complete membership tables and merge the received entries using the membership merge rules.
+
+The default gossip interval is 1000 milliseconds, with a configurable fanout of two peers per gossip round.
+
+Full-table gossip is intentionally simple and appropriate for the expected small cluster size. Each membership entry is approximately 100 bytes, making the approach practical for clusters of roughly 50 nodes.
+
+This approach does not scale efficiently to large clusters because the amount of information exchanged increases with membership table size. Production SWIM implementations typically use bounded dissemination of recent membership updates instead of transmitting the entire table.
+
+### Bootstrap and Dynamic Node Discovery
+
+A node can start with a static membership configuration or use seed addresses to discover an existing cluster.
+
+- **Static bootstrap:** Configured members are initially added to the local membership table as ALIVE entries with incarnation zero. The local node starts with its own boot-time incarnation.
+- **Seed-based bootstrap:** A node with no static member list but configured seed addresses starts in JOINING state and contacts seed nodes through the internal RPC interface to discover existing membership information.
+- **Activation:** A JOINING node transitions to ALIVE when cluster activation completes. Activation increments its incarnation so that its ALIVE entry supersedes stale membership information.
+
+Seeds are initial discovery contacts, not permanent coordinators. Membership is subsequently learned and maintained through gossip.
+
+### Membership Versus Consistent Hashing
+
+Membership and consistent-hashing ring ownership are separate concerns.
+
+A node becoming DEAD does not remove it from the consistent-hashing ring. Membership records its liveness, while the ring preserves its ownership position.
+
+Routing and replica selection skip DEAD nodes and continue to the next eligible healthy nodes when selecting replicas.
+
+Keeping DEAD nodes in the ring prevents temporary failures or flapping nodes from repeatedly rebuilding the ring and reshuffling key ownership.
+
+The ring changes only when a node appears for the first time. A returning node with the same stable node ID retains its original ring position.
+
+Permanent node removal and ring ownership redistribution are explicit operations deferred to Phase 6.
+
+### Dynamic Join and Data Migration
+
+A newly discovered node is added to the membership table and consistent-hashing ring when it joins the cluster.
+
+However, historical keys belonging to the new node's ownership ranges are not automatically transferred during Phase 4.
+
+Consequently, reads for existing keys that are now assigned to the new node may temporarily miss until data migration and synchronization are implemented in Phase 6.
+
+Dynamic membership therefore changes ownership before it guarantees that the new owner has received the corresponding historical data.
+
+### Graceful Shutdown
+
+The current `stop()` operation does not announce a graceful departure to the cluster.
+
+From the perspective of other nodes, a stopped node behaves like a crashed node and is detected through normal probing and suspicion.
+
+The LEAVING state is defined in the membership model but is not actively used until Phase 6, when graceful departure and permanent membership removal are implemented.
+
+### Expected Failure Detection Time
+
+With the default configuration:
+
+- Probe interval: 1000 ms.
+- Direct probe timeout: 500 ms.
+- Indirect probes: 2.
+- Suspicion timeout: 5000 ms.
+
+A failed node should be selected for probing by some surviving node within approximately one probe interval.
+
+After direct and indirect probes fail, the node becomes SUSPECT, typically within approximately 1–2 seconds of failure under normal scheduling and network conditions.
+
+The suspicion timer then allows approximately another 5 seconds for refutation before the node becomes DEAD.
+
+The expected total failure detection time is approximately 6–8 seconds, targeting detection within 10 seconds under normal network conditions. This is an operational target, not a hard upper-bound guarantee.
+
+### Membership and Failure Detection Limitations
+
+The current design has the following limitations:
+
+- Full-table gossip is intended for small clusters of approximately 50 nodes and is not optimized for large-scale membership dissemination.
+- Membership convergence is eventual. Nodes may temporarily maintain different views of cluster state.
+- Local suspicion timers can expire at different times because nodes may learn about suspicions at different times.
+- Boot-time incarnation numbers assume the wall clock does not move backwards across restarts. Incarnation persistence is not currently implemented.
+- Dynamic joins do not automatically migrate historical data. Data redistribution and synchronization are deferred to Phase 6.
+- Graceful departure announcements and permanent node removal are not implemented in this phase.
+- Failure detection cannot perfectly distinguish a crashed node from a slow or temporarily unreachable node.

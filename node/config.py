@@ -17,6 +17,8 @@ class Member:
         try:
             node_id, addr = spec.split("@", 1)
             host, port, rpc_port = addr.rsplit(":", 2)
+            if not node_id or not host:
+                raise ValueError
             return cls(node_id, host, int(port), int(rpc_port))
         except ValueError:
             raise SystemExit(f"bad member {spec!r}; expected id@host:port:rpc_port") from None
@@ -28,56 +30,182 @@ class NodeConfig:
     host: str = "127.0.0.1"
     port: int = 7001
     rpc_port: int = 8001
-    members: list[str] = field(default_factory=list)  # "id@host:port:rpc", INCLUDING self
+
+    members: list[str] = field(default_factory=list)
+    # "id@host:port:rpc", INCLUDING self
+
+    advertise_host: str = ""
+    # Address peers use to reach this node.
+    # Defaults to host when empty.
+
+    seeds: list[str] = field(default_factory=list)
+    # "host:rpc_port"
+
     replicas: int = 3  # N
     write_acks: int = 1  # W
+
     rpc_timeout_ms: int = 500
     tombstone_grace_ms: int = 600_000
     vnodes: int = 150
     sweep_interval_ms: int = 100
+
+    gossip_interval_ms: int = 1000
+    gossip_fanout: int = 2
+
+    probe_interval_ms: int = 1000
+    probe_timeout_ms: int = 500
+    indirect_probes: int = 2
+    suspect_timeout_ms: int = 5000
+
     log_level: str = "INFO"
 
     def member_list(self) -> list[Member]:
-        if not self.members:  # single-node mode
-            return [Member(self.node_id, self.host, self.port, self.rpc_port)]
+        if not self.members:
+            # Single-node mode
+            return [
+                Member(
+                    self.node_id,
+                    self.advertise_host or self.host,
+                    self.port,
+                    self.rpc_port,
+                )
+            ]
+
         return [Member.parse(s) for s in self.members]
 
+    def seed_addrs(self) -> list[tuple[str, int]]:
+        """Parse seed addresses into (host, rpc_port) tuples."""
+        out = []
+
+        for s in self.seeds:
+            try:
+                host, port = s.rsplit(":", 1)
+
+                if not host:
+                    raise ValueError
+
+                out.append((host, int(port)))
+
+            except ValueError:
+                raise SystemExit(f"bad seed {s!r}; expected host:rpc_port") from None
+
+        return out
+
     def validate(self) -> None:
-        ids = [m.node_id for m in self.member_list()]
+        members = self.member_list()
+        ids = [m.node_id for m in members]
+
         if len(set(ids)) != len(ids):
             raise SystemExit("duplicate node ids in members")
+
         if self.node_id not in ids:
             raise SystemExit(f"{self.node_id} is not listed in members")
+
         if self.replicas < 1:
             raise SystemExit("replicas must be >= 1")
+
         if not 1 <= self.write_acks <= self.replicas:
             raise SystemExit("write_acks must be between 1 and replicas")
+
+        # Validate member endpoints.
+        for member in members:
+            if (
+                not member.host
+                or not 1 <= member.port <= 65535
+                or not 1 <= member.rpc_port <= 65535
+            ):
+                raise SystemExit(f"invalid endpoint for member {member.node_id}")
+
+        # Validate seeds.
+        self.seed_addrs()
+
+        # Validate timing and probing configuration.
+        positive_values = {
+            "gossip_interval_ms": self.gossip_interval_ms,
+            "probe_interval_ms": self.probe_interval_ms,
+            "probe_timeout_ms": self.probe_timeout_ms,
+            "suspect_timeout_ms": self.suspect_timeout_ms,
+            "rpc_timeout_ms": self.rpc_timeout_ms,
+        }
+
+        for name, value in positive_values.items():
+            if value <= 0:
+                raise SystemExit(f"{name} must be > 0")
+
+        if self.gossip_fanout < 1:
+            raise SystemExit("gossip_fanout must be >= 1")
+
+        if self.indirect_probes < 0:
+            raise SystemExit("indirect_probes must be >= 0")
 
     @classmethod
     def load(cls, argv: list[str] | None = None) -> "NodeConfig":
         """Precedence: defaults < JSON file < CLI flags."""
+
         p = argparse.ArgumentParser(prog="python -m node")
+
         p.add_argument("--config")
         p.add_argument("--node-id")
         p.add_argument("--host")
         p.add_argument("--port", type=int)
         p.add_argument("--rpc-port", type=int)
-        p.add_argument("--members", help="comma-separated id@host:port:rpc_port")
+
+        p.add_argument(
+            "--members",
+            help="comma-separated id@host:port:rpc_port",
+        )
+
+        p.add_argument("--seeds", help="comma-separated host:rpc_port")
+        p.add_argument("--advertise-host")
+
         p.add_argument("--replicas", type=int)
         p.add_argument("--write-acks", type=int)
         p.add_argument("--log-level")
+
         a = p.parse_args(argv)
 
         cfg = cls()
+
+        # 1. Load JSON configuration.
         if a.config:
-            for k, v in json.loads(Path(a.config).read_text()).items():
+            try:
+                data = json.loads(Path(a.config).read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"cannot load config {a.config!r}: {exc}") from None
+
+            if not isinstance(data, dict):
+                raise SystemExit("config JSON must contain an object")
+
+            for k, v in data.items():
                 if not hasattr(cfg, k):
                     raise SystemExit(f"unknown config key: {k}")
+
                 setattr(cfg, k, v)
-        for name in ("node_id", "host", "port", "rpc_port", "replicas", "write_acks", "log_level"):
+
+        # 2. Apply CLI overrides.
+        simple_names = (
+            "node_id",
+            "host",
+            "port",
+            "rpc_port",
+            "advertise_host",
+            "replicas",
+            "write_acks",
+            "log_level",
+        )
+
+        for name in simple_names:
             v = getattr(a, name)
+
             if v is not None:
                 setattr(cfg, name, v)
+
         if a.members is not None:
             cfg.members = [x for x in a.members.split(",") if x]
+
+        if a.seeds is not None:
+            cfg.seeds = [x for x in a.seeds.split(",") if x]
+
+        cfg.validate()
+
         return cfg
