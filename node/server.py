@@ -67,17 +67,6 @@ class Server:
             },
         )
 
-        # Internal RPC server for communication between cluster nodes.
-        # Coordinator and gossip handlers share the same RPC server.
-        self.rpc = RpcServer(
-            cfg.host,
-            cfg.rpc_port,
-            {
-                **self.coord.handlers(),
-                **self.gossip.handlers(),
-            },
-        )
-
         # ---- client-facing server lifecycle ----
 
         self._server: asyncio.Server | None = None
