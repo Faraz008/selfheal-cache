@@ -4,6 +4,7 @@ import logging
 from . import resp
 from .config import NodeConfig
 from .coordinator import ClusterError, Coordinator
+from .detector import FailureDetector
 from .gossip import Gossiper
 from .membership import Membership
 from .rpc import Peers, RpcServer
@@ -47,6 +48,23 @@ class Server:
             cfg,
             self.membership,
             self.peers,
+        )
+
+        self.detector = FailureDetector(
+            cfg,
+            self.membership,
+            self.peers,
+            self.gossip,
+        )
+
+        self.rpc = RpcServer(
+            cfg.host,
+            cfg.rpc_port,
+            {
+                **self.coord.handlers(),
+                **self.gossip.handlers(),
+                **self.detector.handlers(),
+            },
         )
 
         # Internal RPC server for communication between cluster nodes.
@@ -95,6 +113,7 @@ class Server:
 
         # Start membership gossip after RPC is available.
         await self.gossip.start()
+        await self.detector.start()
 
         # Start the client-facing RESP server.
         self._server = await asyncio.start_server(
@@ -123,6 +142,7 @@ class Server:
 
     async def stop(self) -> None:
         # Stop gossip before shutting down internal RPC.
+        await self.detector.stop()
         await self.gossip.stop()
 
         # Stop the background sweeper.

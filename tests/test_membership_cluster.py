@@ -63,3 +63,35 @@ async def test_gossip_spreads_new_member_and_updates_ring(start):
         )
 
     await eventually(everywhere, timeout=3)
+
+
+async def test_kill_is_detected_by_every_node(start):
+    servers = [await start(c) for c in static_cfgs(5)]
+    victim = servers[2]
+    survivors = [s for s in servers if s is not victim]
+    t0 = time.monotonic()
+    await victim.stop()  # no goodbye: indistinguishable from a crash
+
+    async def all_dead():
+        return all(s.membership.get("n3").state is State.DEAD for s in survivors)
+
+    await eventually(all_dead, timeout=6)
+    print(f"\nconvergence: {time.monotonic() - t0:.2f}s")
+    for s in survivors:
+        for nid in ("n1", "n2", "n4", "n5"):
+            assert s.membership.get(nid).state is not State.DEAD
+
+
+async def test_indirect_probe_prevents_false_suspicion(start):
+    servers = [await start(c) for c in static_cfgs(3)]
+    n1 = servers[0]
+    real = n1.peers.call
+
+    async def broken(node_id, op, args=None, timeout=None):
+        if node_id == "n3" and op in ("ping", "gossip"):
+            raise RpcError("simulated broken path n1->n3")
+        return await real(node_id, op, args, timeout)
+
+    n1.peers.call = broken  # only n1's path to n3 is cut; n3 itself is fine
+    await asyncio.sleep(1.5)  # ~20 probe rounds
+    assert n1.membership.get("n3").state is State.ALIVE
