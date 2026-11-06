@@ -212,7 +212,7 @@ Results:
 - Lookup time includes MD5 hashing and binary search.
 - Ring reconstruction is required only when cluster membership changes, rather than on every request.
 
-### 4. Phase 2 Conclusion
+### 4. Conclusion
 
 The Phase 2 experiments demonstrate that consistent hashing significantly reduces key movement compared with modulo hashing.
 
@@ -235,6 +235,85 @@ These results establish the consistent hashing performance baseline before integ
 
 ---
 
+## Phase 3 — Node Failure Detection
+
+### Environment and Configuration
+
+- Date: 06-11-2026
+- Machine: Windows laptop (WSL2)
+- OS: Ubuntu 24.04
+- Python: 3.12
+- Cluster: 5 nodes
+- Failed node: n3
+- Failure simulation: Manual process termination
+- Detection mechanism: SWIM-style direct and indirect probing with gossip-based membership dissemination
+- Measurement: Time between terminating n3 and the last healthy node reporting it as DEAD
+
+### 1. Node Failure Detection Time
+
+The experiment measured how long the cluster took to detect a failed node after its process was terminated.
+
+The five-node cluster was started using:
+
+```bash
+./scripts/run_cluster.sh 5
+```
+
+Node n3 was manually terminated while the remaining healthy nodes continued running.
+
+The cluster's membership state was monitored until all healthy nodes reported n3 as `DEAD`.
+
+**Observed Results:**
+
+| Metric | Result |
+|---|---:|
+| Total cluster nodes | 5 |
+| Failed node | n3 |
+| Failure event | Manual process termination |
+| Node termination timestamp | 10:23:02.637 |
+| Last DEAD report timestamp | 10:23:12.435 |
+| Total detection time | 9,798 ms |
+| Detection time (seconds) | 9.80 seconds |
+
+**Detection Time Calculation:**
+
+```text
+Detection Time = Last DEAD Report - Node Termination Time
+
+               = 10:23:12.435 - 10:23:02.637
+
+               = 9.798 seconds
+
+               = 9,798 ms
+```
+
+### 2. Observations
+
+- Node n3 was manually terminated to simulate an unexpected node failure.
+- The remaining healthy nodes continued operating during the failure simulation.
+- The cluster detected the failed node and updated its membership state to `DEAD`.
+- The last healthy node reported n3 as `DEAD` approximately 9.80 seconds after termination.
+- This demonstrates that failure information propagated across the cluster through the gossip mechanism.
+
+### 3. Conclusion
+
+The Phase 3 failure detection experiment demonstrated that the cluster can detect an unexpected node failure and propagate the updated membership state to the remaining healthy nodes.
+
+In the five-node cluster experiment, the last healthy node reported the failed node as `DEAD` approximately 9.80 seconds after its process was terminated.
+
+This establishes an initial baseline for gossip-based failure detection. Further experiments can evaluate detection time across different cluster sizes, gossip intervals and failure scenarios.
+
+### 4. Known Limitations
+
+- Only one failure detection experiment was recorded.
+- The experiment used manual process termination rather than network partition simulation.
+- Measurements were collected in WSL2 and may vary with CPU load and scheduling.
+- Detection time was measured until the last healthy node reported the failed node as `DEAD`.
+- The result does not establish an average or worst-case detection time.
+- No repeated trials or statistical analysis were performed.
+
+---
+
 ## Overall Benchmark Summary
 
 | Phase | Component | Main Result |
@@ -244,4 +323,16 @@ These results establish the consistent hashing performance baseline before integ
 | Phase 2 | Ring construction | 9.3 ms (10 nodes, 150 vnodes each) |
 | Phase 2 | Key movement | 8.8% (10 → 11 nodes) |
 | Phase 2 | Distribution | 9.4% CV (150 vnodes) |
+| Phase 3 | Gossip-based failure detection | 9.80 seconds (5-node cluster) |
 
+### Overall Conclusion
+
+The benchmarks establish initial performance and behavior baselines for the self-healing distributed cache.
+
+- **Phase 1:** The single-node RESP server achieved approximately 30k operations per second.
+- **Phase 2:** Consistent hashing reduced key movement during membership changes, with low lookup overhead and reasonably balanced key distribution.
+- **Phase 3:** The five-node cluster successfully detected a terminated node and propagated the `DEAD` state to all remaining healthy nodes in approximately 9.80 seconds.
+
+These results provide a foundation for evaluating the performance, scalability and fault tolerance of subsequent cluster implementations.
+
+All measurements should be treated as initial experimental baselines rather than statistically validated performance guarantees.

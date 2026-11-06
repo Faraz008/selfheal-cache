@@ -2,7 +2,7 @@
 
 A lightweight, self-healing distributed cache built from scratch in Python.
 
-SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, data storage, TTL expiration, consistent hashing, replication, failure detection, and eventual consistency.
+SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, key-value storage, TTL expiration, consistent hashing, node membership, gossip protocols, failure detection, and eventual consistency.
 
 The project is being developed incrementally, starting with a working single-node cache and expanding toward a distributed, self-healing architecture.
 
@@ -12,9 +12,10 @@ The project is being developed incrementally, starting with a working single-nod
 - Support basic key-value operations.
 - Implement TTL-based key expiration.
 - Introduce communication between multiple cache nodes.
+- Implement consistent hashing and data distribution.
 - Implement replication and eventual consistency.
-- Detect node failures and recover from them.
-- Explore anti-entropy mechanisms for data synchronization.
+- Detect node failures through distributed membership protocols.
+- Explore anti-entropy mechanisms for data synchronization and recovery.
 
 ## Current Status
 
@@ -41,13 +42,29 @@ The project is being developed incrementally, starting with a working single-nod
 | Vnode distribution experiments | Completed |
 | Performance measurements | Completed |
 
-Distributed replication, gossip-based failure detection, and anti-entropy synchronization are planned for subsequent phases.
+### Phase 3 — Cluster Membership and Failure Detection
+
+| Feature | Status |
+|---|---|
+| Multi-node cluster startup | Implemented |
+| Seed-based node discovery | Implemented |
+| Gossip-based membership | Implemented |
+| Failure detection | Implemented |
+| Suspect and dead node states | Implemented |
+| Indirect probing | Implemented |
+| Membership inspection using `CLUSTER NODES` | Implemented |
+| Failure-detection timing experiment | Completed |
+
+**Failure-detection experiment:** In a five-node cluster, node `n3` was terminated manually. The last healthy node marked it as `DEAD` approximately 9.80 seconds after termination.
+
+Replication, data recovery, and anti-entropy synchronization remain part of the planned development.
 
 ## Tech Stack
 
 - Python 3.12
 - Asyncio
 - RESP protocol
+- TCP networking
 - Pytest
 - Ruff
 - Matplotlib
@@ -80,6 +97,9 @@ selfheal-cache/
 │
 ├── bench/
 │   └── bench.py
+│
+├── scripts/
+│   └── run_cluster.sh
 │
 ├── docs/
 │   ├── DESIGN.md
@@ -130,15 +150,76 @@ Install the project and development dependencies:
 pip install -e ".[dev,analysis]"
 ```
 
-### 4. Run the cache server
-
-Start a node:
+### 4. Run a single cache node
 
 ```bash
 python -m node --node-id n1 --port 7001 --log-level DEBUG
 ```
 
 The server starts on port `7001`.
+
+You can connect to it using `redis-cli`:
+
+```bash
+redis-cli -p 7001
+```
+
+Try basic commands:
+
+```redis
+SET name "SelfHeal Cache"
+GET name
+SET temporary "hello" EX 30
+TTL temporary
+```
+
+## Running a Multi-Node Cluster
+
+The project includes a cluster startup script that launches multiple nodes and uses seed-based discovery to allow nodes to join the cluster.
+
+From the project root, run:
+
+```bash
+./scripts/run_cluster.sh 5
+```
+
+This starts a five-node cluster.
+
+Each node exposes a client-facing RESP port. The cluster script prints the process information and ports for the launched nodes.
+
+### Inspect Cluster Membership
+
+Connect to one of the nodes:
+
+```bash
+redis-cli -p 7001
+```
+
+Run:
+
+```redis
+CLUSTER NODES
+```
+
+The command displays the node membership information, including:
+
+- Node ID
+- Node address
+- Membership state
+- Incarnation number
+- `myself` marker for the local node
+
+Example format:
+
+```text
+n1 127.0.0.1:7001 alive 1793961276354 myself
+n2 127.0.0.1:7002 alive 1793961276360
+n3 127.0.0.1:7003 alive 1793961276358
+n4 127.0.0.1:7004 alive 1793961276362
+n5 127.0.0.1:7005 alive 1793961276358
+```
+
+The output above illustrates the format; actual node states and incarnation numbers depend on the running cluster.
 
 ## Running Tests
 
@@ -176,9 +257,11 @@ redis-benchmark -p 7001 -t set,get -n 100000 -q
 
 This command benchmarks SelfHeal Cache on port `7001`; it does not benchmark a Redis server.
 
-### Initial Benchmark Results
+## Benchmark Results
 
-Environment: Windows laptop running Ubuntu 24.04 through WSL2, Python 3.12.
+All measurements were collected on a Windows laptop running Ubuntu 24.04 through WSL2, using Python 3.12.
+
+### Phase 1 — Single-Node Performance
 
 | Benchmark | Operations | Throughput |
 |---|---:|---:|
@@ -209,9 +292,9 @@ The distribution experiment measured load imbalance across 10 physical nodes wit
 
 ![Vnode balance](docs/img/vnode_balance.png)
 
-At 150 virtual nodes per physical node, the coefficient of variation was approximately 9.4%. Increasing to 500 vnodes reduced it to 5.5%, with additional construction overhead.
+At 150 virtual nodes per physical node, the coefficient of variation was approximately 9.4%. Increasing to 500 vnodes reduced it to 5.5%, with additional ring construction overhead.
 
-The default configuration therefore uses 150 virtual nodes per physical node.
+The default configuration therefore uses 150 virtual nodes per physical node as a balance between distribution quality and construction cost.
 
 #### 3. Key Distribution
 
@@ -230,9 +313,26 @@ The following chart shows the distribution of 100,000 keys across five physical 
 | Average lookup time | 1.48 μs |
 | Keys evaluated | 100,000 |
 
-The lookup measurement includes key hashing and ring lookup.
+The lookup measurement includes key hashing and ring lookup, not network communication or replication.
 
-See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for detailed measurements and methodology.
+### Phase 3 — Failure Detection
+
+A five-node cluster was used to evaluate gossip-based failure detection.
+
+| Metric | Result |
+|---|---:|
+| Cluster size | 5 nodes |
+| Failed node | n3 |
+| Failure method | Manual process termination |
+| Last healthy node's detection time | 9.798 seconds |
+
+The experiment measured the time between terminating `n3` and the last healthy node marking it as `DEAD`.
+
+The observed detection time was approximately **9.80 seconds**.
+
+This was a single manual failure experiment, not a statistically controlled benchmark. Results may vary with network conditions, system load, and cluster configuration.
+
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for detailed measurements, methodology, and limitations.
 
 ## Development
 
@@ -258,7 +358,21 @@ ruff format .
 
 The project is being built incrementally, prioritizing understanding and correctness before optimization.
 
+The architecture explores distributed-systems concepts such as:
+
+- Leaderless coordination
+- Consistent hashing and virtual nodes
+- Gossip-based membership
+- Failure detection and node state transitions
+- Eventual consistency
+- Replication and anti-entropy (planned)
+
 The long-term goal is to develop a distributed cache that can tolerate node failures, synchronize data between available nodes, and recover automatically without requiring a centralized coordinator.
+
+## Documentation
+
+- [`docs/DESIGN.md`](docs/DESIGN.md) — Architecture, design decisions, and system guarantees.
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — Benchmark methodology, results, and observations.
 
 ## License
 

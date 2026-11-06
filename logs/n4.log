@@ -1,0 +1,13 @@
+2026-11-06 10:34:36,361 INFO node=n4 member n4 -> joining (inc 1793961276361)
+2026-11-06 10:34:36,361 INFO node=n4 ring rebuilt: ['n4']
+2026-11-06 10:34:36,364 INFO node=n4 client port 7004, RPC port 8004, members=['n4'] N=3 W=1
+2026-11-06 10:34:36,369 INFO node=n4 member n1 -> alive (inc 1793961276354)
+2026-11-06 10:34:36,369 INFO node=n4 member n5 -> joining (inc 1793961276357)
+2026-11-06 10:34:36,369 INFO node=n4 member n3 -> joining (inc 1793961276357)
+2026-11-06 10:34:36,369 INFO node=n4 member n2 -> joining (inc 1793961276359)
+2026-11-06 10:34:36,371 INFO node=n4 ring rebuilt: ['n1', 'n2', 'n3', 'n4', 'n5']
+2026-11-06 10:34:36,371 INFO node=n4 member n4 -> alive (inc 1793961276362)
+2026-11-06 10:34:36,371 INFO node=n4 joined via seed 127.0.0.1:8001
+2026-11-06 10:34:37,225 INFO node=n4 member n3 -> alive (inc 1793961276358)
+2026-11-06 10:34:37,303 INFO node=n4 member n5 -> alive (inc 1793961276358)
+2026-11-06 10:34:38,155 INFO node=n4 member n2 -> alive (inc 1793961276360)

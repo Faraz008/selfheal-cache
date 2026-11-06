@@ -172,3 +172,14 @@ async def test_returning_node_is_alive_again(start):
     await eventually(sees(servers[0], "n3", State.ALIVE), timeout=6)
     await eventually(sees(servers[1], "n3", State.ALIVE), timeout=6)
     assert servers[0].membership.get("n3").incarnation > dead_inc
+
+
+async def test_read_order_puts_dead_and_joining_last(start):
+    cfg = static_cfgs(3, replicas=3, probe_interval_ms=60_000, gossip_interval_ms=60_000)[0]
+    s = await start(cfg)  # only n1 runs; its view of n2/n3 is what we test
+    first = s.coord.read_order(b"k")[0]
+    s.membership.merge([replace(s.membership.get(first), state=State.DEAD, incarnation=10)])
+    order = s.coord.read_order(b"k")
+    assert order[-1] == first and sorted(order) == ["n1", "n2", "n3"]
+    s.membership.merge([replace(s.membership.get(order[0]), state=State.JOINING, incarnation=10)])
+    assert s.coord.read_order(b"k")[-1] == first  # DEAD still behind JOINING

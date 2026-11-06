@@ -87,10 +87,18 @@ class Coordinator:
         v = self.versions.next()
         await self._replicate(key, Record(None, v, v[0]))  # tombstone
 
+    def read_order(self, key: bytes) -> list[str]:
+        """Preference list, best candidates first: ALIVE, SUSPECT, JOINING, DEAD.
+        sorted() is stable, so ring order is preserved within each class."""
+        return sorted(self.preference_list(key), key=self.m.read_priority)
+
     async def read(self, key: bytes) -> Record | None:
         """Live record or None. First replica that answers wins."""
+        order = self.read_order(key)
+        if not order:
+            raise ClusterError("empty ring")
         last_err: Exception | None = None
-        for nid in self.preference_list(key):
+        for nid in order:  # DEAD nodes are tried last, never skipped: we might be wrong
             try:
                 if nid == self.id:
                     rec = self.store.get_record(key)
@@ -116,8 +124,15 @@ class Coordinator:
             return False
 
     async def _replicate(self, key: bytes, rec: Record) -> None:
-        targets = self.preference_list(key)
-        need = min(self.cfg.write_acks, len(targets))
+        pref = self.preference_list(key)
+        if not pref:
+            raise ClusterError("empty ring")
+        need = min(self.cfg.write_acks, len(pref))
+        targets = [
+            n for n in pref if not self.m.is_dead(n)
+        ]  # don't pay a timeout for a known-dead node
+        if len(targets) < need:
+            raise ClusterError(f"only {len(targets)} of {len(pref)} replicas alive, need {need}")
         tasks = []
         for nid in targets:
             t = asyncio.create_task(self._put(nid, key, rec))
