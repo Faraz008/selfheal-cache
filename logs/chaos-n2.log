@@ -1,0 +1,25 @@
+2026-11-07 08:58:42,628 INFO node=n2 member n2 -> joining (inc 1794041922627)
+2026-11-07 08:58:42,628 INFO node=n2 ring rebuilt: ['n2']
+2026-11-07 08:58:42,632 WARNING node=n2 seed 127.0.0.1:8101 unreachable: gossip to 127.0.0.1:8101 failed: ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 8101)")
+2026-11-07 08:58:42,633 INFO node=n2 client port 7102, RPC port 8102, members=['n2'] N=3 W=2
+2026-11-07 08:58:42,837 INFO node=n2 member n1 -> alive (inc 1794041922631)
+2026-11-07 08:58:42,837 INFO node=n2 member n3 -> joining (inc 1794041922623)
+2026-11-07 08:58:42,837 INFO node=n2 member n5 -> joining (inc 1794041922626)
+2026-11-07 08:58:42,838 INFO node=n2 ring rebuilt: ['n1', 'n2', 'n3', 'n5']
+2026-11-07 08:58:42,839 INFO node=n2 member n2 -> alive (inc 1794041922628)
+2026-11-07 08:58:42,839 INFO node=n2 joined via seed 127.0.0.1:8101
+2026-11-07 08:58:43,595 INFO node=n2 member n3 -> alive (inc 1794041922624)
+2026-11-07 08:58:43,595 INFO node=n2 member n4 -> joining (inc 1794041922629)
+2026-11-07 08:58:43,597 INFO node=n2 ring rebuilt: ['n1', 'n2', 'n3', 'n4', 'n5']
+2026-11-07 08:58:43,613 INFO node=n2 member n4 -> alive (inc 1794041922630)
+2026-11-07 08:58:43,658 INFO node=n2 member n5 -> alive (inc 1794041922627)
+2026-11-07 08:59:04,073 INFO node=n2 member n2 -> joining (inc 1794041944073)
+2026-11-07 08:59:04,073 INFO node=n2 ring rebuilt: ['n2']
+2026-11-07 08:59:04,074 INFO node=n2 client port 7102, RPC port 8102, members=['n2'] N=3 W=2
+2026-11-07 08:59:04,075 INFO node=n2 member n1 -> alive (inc 1794041922631)
+2026-11-07 08:59:04,075 INFO node=n2 member n3 -> alive (inc 1794041922624)
+2026-11-07 08:59:04,076 INFO node=n2 member n5 -> alive (inc 1794041922627)
+2026-11-07 08:59:04,076 INFO node=n2 member n4 -> alive (inc 1794041922630)
+2026-11-07 08:59:04,077 INFO node=n2 ring rebuilt: ['n1', 'n2', 'n3', 'n4', 'n5']
+2026-11-07 08:59:04,077 INFO node=n2 member n2 -> alive (inc 1794041944074)
+2026-11-07 08:59:04,077 INFO node=n2 joined via seed 127.0.0.1:8101
