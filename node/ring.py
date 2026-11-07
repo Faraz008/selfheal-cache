@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 from bisect import bisect_right
 
 
@@ -57,23 +58,25 @@ class Ring:
         owners = self.get_preference_list(key, 1)
         return owners[0] if owners else None
 
-    def get_preference_list(self, key: bytes | str, n: int) -> list[str]:
-        """First n DISTINCT physical nodes clockwise from the key's hash.
-        Returns fewer than n if the cluster has fewer than n nodes."""
-        if n < 1 or not self._hashes:
-            return []
+    def walk(self, key: bytes | str):
+        """Yield every distinct physical node once, clockwise from the key.
+        The first N are the preference list; the rest are stand-in candidates."""
+        if not self._hashes:
+            return
         if isinstance(key, str):
             key = key.encode()
-        want = min(n, len(self._nodes))
         size = len(self._hashes)
         start = bisect_right(self._hashes, hash64(key))
-        out: list[str] = []
         seen: set[str] = set()
-        for i in range(size):  # at most one full lap
-            owner = self._owners[(start + i) % size]  # % handles wraparound
+        for i in range(size):
+            owner = self._owners[(start + i) % size]
             if owner not in seen:
                 seen.add(owner)
-                out.append(owner)
-                if len(out) == want:
-                    break
-        return out
+                yield owner
+                if len(seen) == len(self._nodes):
+                    return
+
+    def get_preference_list(self, key: bytes | str, n: int) -> list[str]:
+        if n < 1:
+            return []
+        return list(itertools.islice(self.walk(key), n))

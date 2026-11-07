@@ -125,3 +125,15 @@ def test_replica_load_is_balanced():
     counts = Counter(n for k in keys(30_000) for n in r.get_preference_list(k, 3))
     mean = 30_000 * 3 / 5
     assert all(abs(c - mean) / mean < 0.25 for c in counts.values())
+
+
+def test_walk_yields_every_node_once_and_extends_preference_list():
+    r = make_ring(5)
+    for k in keys(500):
+        w = list(r.walk(k))
+        assert sorted(w) == ["n1", "n2", "n3", "n4", "n5"]
+        assert w[:3] == r.get_preference_list(k, 3)
+
+
+def test_walk_on_empty_ring():
+    assert list(Ring().walk(b"k")) == []

@@ -17,9 +17,12 @@ class Member:
         try:
             node_id, addr = spec.split("@", 1)
             host, port, rpc_port = addr.rsplit(":", 2)
+
             if not node_id or not host:
                 raise ValueError
+
             return cls(node_id, host, int(port), int(rpc_port))
+
         except ValueError:
             raise SystemExit(f"bad member {spec!r}; expected id@host:port:rpc_port") from None
 
@@ -56,6 +59,16 @@ class NodeConfig:
     probe_timeout_ms: int = 500
     indirect_probes: int = 2
     suspect_timeout_ms: int = 5000
+
+    # Read coordination
+    hedge_ms: int = 50
+    read_fanout: int = 2  # replicas consulted per read; newest version wins
+
+    # Hinted handoff
+    hint_ttl_ms: int = 300_000
+    max_hints: int = 100_000
+    hint_batch: int = 200
+    hint_replay_interval_ms: int = 1000
 
     log_level: str = "INFO"
 
@@ -137,6 +150,13 @@ class NodeConfig:
 
         if self.indirect_probes < 0:
             raise SystemExit("indirect_probes must be >= 0")
+
+        # Validate read coordination and hinted handoff.
+        if self.read_fanout < 1:
+            raise SystemExit("read_fanout must be >= 1")
+
+        if self.hint_ttl_ms > self.tombstone_grace_ms:
+            raise SystemExit("hint_ttl_ms must be <= tombstone_grace_ms (resurrection risk)")
 
     @classmethod
     def load(cls, argv: list[str] | None = None) -> "NodeConfig":

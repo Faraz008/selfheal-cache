@@ -65,7 +65,15 @@ async def test_pipelining(client):
 
 
 async def test_sweeper_collects_without_reads():
-    s = Server(NodeConfig(port=0, rpc_port=0, sweep_interval_ms=20, tombstone_grace_ms=0))
+    s = Server(
+        NodeConfig(
+            port=0,
+            rpc_port=0,
+            sweep_interval_ms=20,
+            tombstone_grace_ms=0,
+            hint_ttl_ms=0,
+        )
+    )
     await s.start()
     c = await connect(s.port)
     try:
