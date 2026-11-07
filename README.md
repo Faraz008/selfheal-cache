@@ -1,20 +1,22 @@
 # SelfHeal Cache
 
-A lightweight, self-healing distributed cache built from scratch in Python.
+A lightweight, self-healing distributed in-memory cache built from scratch in Python.
 
-SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, key-value storage, TTL expiration, consistent hashing, node membership, gossip protocols, failure detection, and eventual consistency.
+SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, key-value storage, TTL expiration, consistent hashing, replication, gossip protocols, failure detection, hinted handoff, and read repair.
 
-The project is being developed incrementally, starting with a working single-node cache and expanding toward a distributed, self-healing architecture.
+The project is developed incrementally, starting with a working single-node cache and expanding toward a distributed, self-healing architecture.
 
 ## Project Goals
 
 - Build a cache server with a Redis-compatible RESP-style client interface.
-- Support basic key-value operations.
-- Implement TTL-based key expiration.
+- Support basic key-value operations and TTL-based key expiration.
 - Introduce communication between multiple cache nodes.
-- Implement consistent hashing and data distribution.
+- Distribute keys across nodes using consistent hashing.
 - Implement replication and eventual consistency.
 - Detect node failures through distributed membership protocols.
+- Improve availability using sloppy quorum and hinted handoff.
+- Improve read latency using hedged reads.
+- Repair stale or missing replicas using read repair.
 - Explore anti-entropy mechanisms for data synchronization and recovery.
 
 ## Current Status
@@ -53,11 +55,28 @@ The project is being developed incrementally, starting with a working single-nod
 | Suspect and dead node states | Implemented |
 | Indirect probing | Implemented |
 | Membership inspection using `CLUSTER NODES` | Implemented |
-| Failure-detection timing experiment | Completed |
+| Failure-detection experiment | Completed |
 
-**Failure-detection experiment:** In a five-node cluster, node `n3` was terminated manually. The last healthy node marked it as `DEAD` approximately 9.80 seconds after termination.
+A five-node experiment was conducted by manually terminating node `n3`. The last healthy node marked it as `DEAD` approximately 9.80 seconds after termination.
 
-Replication, data recovery, and anti-entropy synchronization remain part of the planned development.
+### Phase 4 — Replication and Survival
+
+| Feature | Status |
+|---|---|
+| Versioned records and LWW conflict resolution | Implemented |
+| Replication | Implemented |
+| Hedged reads | Implemented |
+| Configurable read fanout | Implemented |
+| Sloppy quorum | Implemented |
+| Stand-in node selection | Implemented |
+| In-memory hinted handoff | Implemented |
+| Hint replay | Implemented |
+| Read repair | Implemented |
+| Hint capacity limits | Implemented |
+| Node-local `INFO` diagnostics | Implemented |
+| Five-node failure/restart chaos test | Passed |
+
+Historical-data catch-up synchronization for restarted nodes is deferred to Phase 6.
 
 ## Tech Stack
 
@@ -94,6 +113,7 @@ selfheal-cache/
 │   └── ...
 │
 ├── chaos/
+│   └── crude_kill.py
 │
 ├── bench/
 │   └── bench.py
@@ -122,6 +142,7 @@ selfheal-cache/
 - Python 3.12
 - Git
 - Ubuntu/Linux or WSL2
+- Optional: `redis-cli`
 
 ### 1. Clone the repository
 
@@ -156,9 +177,9 @@ pip install -e ".[dev,analysis]"
 python -m node --node-id n1 --port 7001 --log-level DEBUG
 ```
 
-The server starts on port `7001`.
+The server starts on client port `7001`.
 
-You can connect to it using `redis-cli`:
+Connect using `redis-cli`:
 
 ```bash
 redis-cli -p 7001
@@ -167,10 +188,12 @@ redis-cli -p 7001
 Try basic commands:
 
 ```redis
+PING
 SET name "SelfHeal Cache"
 GET name
 SET temporary "hello" EX 30
 TTL temporary
+INFO
 ```
 
 ## Running a Multi-Node Cluster
@@ -187,6 +210,8 @@ This starts a five-node cluster.
 
 Each node exposes a client-facing RESP port. The cluster script prints the process information and ports for the launched nodes.
 
+**Important:** Starting several nodes with only different `--node-id` and `--port` arguments does not necessarily make them members of the same cluster. Use the supplied cluster script or provide the correct peer/seed configuration.
+
 ### Inspect Cluster Membership
 
 Connect to one of the nodes:
@@ -201,7 +226,7 @@ Run:
 CLUSTER NODES
 ```
 
-The command displays the node membership information, including:
+The command displays membership information, including:
 
 - Node ID
 - Node address
@@ -209,7 +234,7 @@ The command displays the node membership information, including:
 - Incarnation number
 - `myself` marker for the local node
 
-Example format:
+Example output format:
 
 ```text
 n1 127.0.0.1:7001 alive 1793961276354 myself
@@ -219,7 +244,57 @@ n4 127.0.0.1:7004 alive 1793961276362
 n5 127.0.0.1:7005 alive 1793961276358
 ```
 
-The output above illustrates the format; actual node states and incarnation numbers depend on the running cluster.
+The output above illustrates the format. Actual node states and incarnation numbers depend on the running cluster.
+
+## Node Diagnostics
+
+The custom `INFO` command provides diagnostic information about the node being queried.
+
+Connect to a node:
+
+```bash
+redis-cli -p 7001 INFO
+```
+
+The command reports:
+
+| Field | Description |
+|---|---|
+| `node_id` | ID of the current node |
+| `live_keys` | Number of currently live keys |
+| `raw_records` | Number of raw records in local storage |
+| `hints_held` | Number of hints currently held by this node |
+| `hints_rejected` | Number of hints rejected because of capacity limits |
+| `hints_written` | Number of hints successfully written by this node |
+| `read_repairs` | Number of read-repair operations recorded by this node |
+
+These are **node-local metrics**, not cluster-wide totals. A counter may remain zero until its corresponding event occurs.
+
+## Client Usage
+
+The server exposes a RESP-compatible interface and can be used with compatible clients.
+
+The following example uses Python's `redis-py` library:
+
+```python
+import redis
+
+cache = redis.Redis(
+    host="127.0.0.1",
+    port=7001,
+    decode_responses=True
+)
+
+cache.ping()
+cache.set("language", "Python")
+print(cache.get("language"))
+cache.set("session", "active", ex=60)
+print(cache.ttl("session"))
+cache.delete("session")
+cache.close()
+```
+
+This demonstrates compatibility through a standard RESP client. It does not demonstrate the API of the project's separate `client/` package.
 
 ## Running Tests
 
@@ -235,9 +310,23 @@ Run a specific test module:
 pytest -v tests/test_resp.py
 ```
 
+Or run the server tests:
+
+```bash
+pytest -v tests/test_server.py
+```
+
 ## Performance Benchmarking
 
-Run the project's Python benchmark:
+The project's Python benchmark connects to an already-running server. It does not start the server itself.
+
+Start a node first:
+
+```bash
+python -m node --node-id n1 --port 7001
+```
+
+In another terminal, run the default benchmark:
 
 ```bash
 python bench/bench.py
@@ -257,11 +346,15 @@ redis-benchmark -p 7001 -t set,get -n 100000 -q
 
 This command benchmarks SelfHeal Cache on port `7001`; it does not benchmark a Redis server.
 
+For distributed testing, start the multi-node cluster and verify membership before running the benchmark. Record the cluster size, node configuration, and benchmark target alongside the results.
+
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for detailed measurements, methodology, and limitations.
+
 ## Benchmark Results
 
 All measurements were collected on a Windows laptop running Ubuntu 24.04 through WSL2, using Python 3.12.
 
-### Phase 1 — Single-Node Performance
+### Phase 1 — Initial Single-Node Performance
 
 | Benchmark | Operations | Throughput |
 |---|---:|---:|
@@ -332,7 +425,82 @@ The observed detection time was approximately **9.80 seconds**.
 
 This was a single manual failure experiment, not a statistically controlled benchmark. Results may vary with network conditions, system load, and cluster configuration.
 
+### Phase 4 — Replication and Survival
+
+#### Single-Node Performance
+
+The benchmark was repeated after introducing the Phase 4 replication and read-coordination changes.
+
+| Benchmark | Operations | Throughput |
+|---|---:|---:|
+| Python benchmark | 200,000 | 20,623 ops/sec |
+| Python benchmark (100 clients) | 400,000 | 19,960 ops/sec |
+
+Compared with the Phase 1 baseline, the measured throughput decreased by approximately 31.5% in the default run and 35.1% in the 100-client run.
+
+**Important:** This was a single-node benchmark. The running membership contained only `n1`, even though the configuration specified a replication factor of three. It does not measure multi-node RPC traffic, stand-in writes, or distributed replication performance.
+
+These results show a single-node performance regression after the Phase 4 changes. They should not be interpreted as a distributed-cluster performance measurement.
+
+#### Five-Node Failure and Restart Experiment
+
+The chaos script was used to test a node failure and restart scenario.
+
+| Metric | Result |
+|---|---:|
+| Cluster size | 5 nodes |
+| Failed node | n2 |
+| Requests | 237,908 |
+| Acknowledged writes | 118,954 |
+| Failed requests | 0 |
+| Client retries | 5 |
+| Lost acknowledged writes | 0 |
+| Latency p50 | 1.3 ms |
+| Latency p99 | 3.6 ms |
+| Maximum latency | 35 ms |
+| Result | PASS |
+
+The experiment terminated `n2`, restarted it, and checked acknowledged writes for loss.
+
+The test passed its acknowledged-write verification for this particular failure and recovery scenario. It does not establish durability across process restarts: storage and hints are in-memory.
+
 See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for detailed measurements, methodology, and limitations.
+
+## Failure and Recovery Testing
+
+Run the five-node chaos experiment:
+
+```bash
+python chaos/crude_kill.py
+```
+
+The script starts a five-node cluster using client ports `7101`–`7105`, terminates `n2`, and restarts it.
+
+A recorded run produced:
+
+```text
+requests=237908  acked_writes=118954
+failed_requests=0  client_retries=5
+lost_acked_writes=0
+latency p50=1.3ms  p99=3.6ms  max=35ms
+PASS
+```
+
+The script checks whether acknowledged writes survive the tested node failure and restart scenario.
+
+This is a targeted failure experiment, not a general durability guarantee. The cache's storage and hinted handoff are in-memory, so a process restart can lose locally stored data and hints.
+
+## Important Design Limitations
+
+- The system is leaderless; any node can coordinate a client request.
+- LWW conflict resolution uses `(timestamp_ms, node_id)`.
+- TTL is represented as an absolute Unix timestamp in milliseconds.
+- Hints are stored in memory and can be lost if a stand-in fails before replay.
+- A restarted node comes back empty until historical catch-up synchronization is implemented in Phase 6.
+- Read repair can restore data only for keys that are read.
+- A sloppy-quorum write acknowledged through a stand-in may not be visible to a quorum read over the original preference list until hint replay or repair.
+- `SET NX` and `SET XX` are best-effort read-then-write operations, not atomic cluster-wide operations.
+- The project does not currently provide disk persistence, transactions, authentication, or TLS.
 
 ## Development
 
@@ -364,15 +532,18 @@ The architecture explores distributed-systems concepts such as:
 - Consistent hashing and virtual nodes
 - Gossip-based membership
 - Failure detection and node state transitions
-- Eventual consistency
-- Replication and anti-entropy (planned)
+- Replication and eventual consistency
+- Hedged reads
+- Sloppy quorum and hinted handoff
+- Read repair
+- Anti-entropy and historical data recovery
 
 The long-term goal is to develop a distributed cache that can tolerate node failures, synchronize data between available nodes, and recover automatically without requiring a centralized coordinator.
 
 ## Documentation
 
-- [`docs/DESIGN.md`](docs/DESIGN.md) — Architecture, design decisions, and system guarantees.
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — Benchmark methodology, results, and observations.
+- [`docs/DESIGN.md`](docs/DESIGN.md) — Architecture, guarantees, failure handling, and design decisions.
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — Benchmark methodology, measurements, and observations.
 
 ## License
 

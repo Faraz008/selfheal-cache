@@ -1,4 +1,4 @@
-# Benchmark Results
+# SelfHeal Cache — Benchmark Results
 
 ## Phase 1 — Initial RESP Server
 
@@ -314,6 +314,187 @@ This establishes an initial baseline for gossip-based failure detection. Further
 
 ---
 
+## Phase 4 — Replication and Survival
+
+### Environment and Configuration
+
+The Phase 4 measurements include a single-node performance benchmark and a separate five-node failure/restart experiment.
+
+These are different tests and should not be interpreted as one combined distributed benchmark.
+
+### 1. Single-Node Performance After Phase 4 Changes
+
+**Environment:**
+
+- Date: 07-11-2026
+- Machine: Windows laptop (WSL2)
+- Python: 3.12
+- Running node: `n1`
+- Client port: 7001
+- Membership observed at startup: `n1` only
+- Configured replication factor: 3
+- Configured write acknowledgements: 1
+
+The benchmark was run after the Phase 4 read and replication changes.
+
+**Default benchmark:**
+
+```bash
+python bench/bench.py
+```
+
+Results:
+
+| Metric | Result |
+|---|---:|
+| Total operations | 200,000 |
+| Execution time | 9.70 seconds |
+| Operations/sec | 20,623 |
+
+**100-client benchmark:**
+
+```bash
+python bench/bench.py --clients 100
+```
+
+Results:
+
+| Metric | Result |
+|---|---:|
+| Total operations | 400,000 |
+| Execution time | 20.04 seconds |
+| Operations/sec | 19,960 |
+| Concurrent clients | 100 |
+
+### 2. Comparison Against Phase 1
+
+| Benchmark | Phase 1 | Phase 4 | Change |
+|---|---:|---:|---:|
+| Python benchmark | 30,111 ops/sec | 20,623 ops/sec | -31.5% |
+| Python benchmark (100 clients) | 30,729 ops/sec | 19,960 ops/sec | -35.1% |
+
+**Observations:**
+
+- The default benchmark decreased from approximately 30.1k to 20.6k operations per second.
+- The 100-client benchmark decreased from approximately 30.7k to 20.0k operations per second.
+- This is a measurable single-node throughput regression compared with the Phase 1 baseline.
+- The benchmark does not establish the exact cause of the regression.
+
+**Important benchmark limitation:**
+
+This was a single-node run. The membership output showed only `n1`, even though the configuration specified a replication factor of three.
+
+Therefore, this experiment does not measure:
+
+- Three-node replication traffic.
+- Internal RPC overhead across multiple nodes.
+- Sloppy-quorum stand-in writes.
+- Hinted handoff between different nodes.
+- Distributed read fanout across multiple nodes.
+- Multi-node failure handling.
+
+A replication factor configured as three does not mean that three active nodes were present in this benchmark.
+
+The results should be described as a single-node performance comparison after the Phase 4 code changes, not as a distributed-cluster throughput benchmark.
+
+### 3. Five-Node Failure and Restart Experiment
+
+The chaos test exercised a five-node cluster while one node was terminated and subsequently restarted.
+
+Command:
+
+```bash
+python chaos/crude_kill.py
+```
+
+The script started five nodes using client ports `7101`–`7105`, terminated `n2`, and restarted it.
+
+**Recorded output:**
+
+```text
+[  1.5s] cluster up: ['127.0.0.1:7101', '127.0.0.1:7102', '127.0.0.1:7103', '127.0.0.1:7104', '127.0.0.1:7105']
+[  9.5s] KILLED n2
+[ 21.5s] RESTARTED n2
+
+=== RESULT ===
+requests=237908  acked_writes=118954
+failed_requests=0  client_retries=5
+lost_acked_writes=0
+latency p50=1.3ms  p99=3.6ms  max=35ms
+PASS
+```
+
+**Results:**
+
+| Metric | Result |
+|---|---:|
+| Cluster size | 5 nodes |
+| Failed node | n2 |
+| Requests | 237,908 |
+| Acknowledged writes | 118,954 |
+| Failed requests | 0 |
+| Client retries | 5 |
+| Lost acknowledged writes | 0 |
+| p50 latency | 1.3 ms |
+| p99 latency | 3.6 ms |
+| Maximum latency | 35 ms |
+| Test result | PASS |
+
+### 4. Observations
+
+- The five-node cluster started successfully.
+- Node `n2` was terminated while the test workload was running.
+- The remaining nodes continued processing requests.
+- The test recorded five client retries.
+- The script reported zero failed requests.
+- The script reported zero lost acknowledged writes after the node was restarted.
+- The recorded p99 latency was 3.6 ms, with a maximum latency of 35 ms.
+
+The experiment demonstrates that the tested failure and restart scenario completed successfully according to the chaos script's acknowledged-write verification.
+
+### 5. Interpretation and Limitations
+
+This result is evidence for one particular failure and restart scenario. It is not proof of general durability or recovery under every failure condition.
+
+Important limitations:
+
+- The experiment is a single recorded run.
+- It does not test simultaneous failures of multiple nodes.
+- It does not test a network partition.
+- It does not test loss of a stand-in before hint replay.
+- It does not establish recovery of every historical key after restart.
+- Storage and hints are in-memory and are not durable across process restarts.
+- The result does not independently prove that every possible acknowledged write survives every possible failure sequence.
+
+The reported zero lost acknowledged writes should be interpreted as the result of the script's verification for this run, not as a general durability guarantee.
+
+### 6. Conclusion
+
+The Phase 4 experiments evaluate two different aspects of the implementation.
+
+The single-node benchmark shows a throughput regression compared with the original Phase 1 baseline. Further profiling and multi-node benchmarks are required to understand the performance impact of the new coordination and replication logic.
+
+The five-node chaos experiment passed its acknowledged-write verification during one node failure and restart scenario, recording zero lost acknowledged writes and zero failed requests.
+
+Together, these results provide an initial baseline for evaluating the performance and failure-handling behavior of the Phase 4 implementation.
+
+### 7. Next Benchmarking Work
+
+Further experiments should include:
+
+- Single-node profiling to identify the source of the throughput regression.
+- A five-node benchmark with the cluster membership verified before measurements.
+- Comparison of strict preference-list writes and sloppy-quorum writes.
+- Read latency measurements with different `read_fanout` values.
+- Measurements with and without hedged reads.
+- Hint replay timing after a node returns.
+- Hint-store capacity and expiration behavior.
+- Repeated node-kill and restart trials.
+- Network partition and multiple-node failure scenarios.
+- Recovery testing for historical keys that were not accessed during downtime.
+
+---
+
 ## Overall Benchmark Summary
 
 | Phase | Component | Main Result |
@@ -324,6 +505,9 @@ This establishes an initial baseline for gossip-based failure detection. Further
 | Phase 2 | Key movement | 8.8% (10 → 11 nodes) |
 | Phase 2 | Distribution | 9.4% CV (150 vnodes) |
 | Phase 3 | Gossip-based failure detection | 9.80 seconds (5-node cluster) |
+| Phase 4 | Single-node benchmark | 20,623 ops/sec |
+| Phase 4 | Single-node benchmark (100 clients) | 19,960 ops/sec |
+| Phase 4 | Five-node failure/restart test | PASS; 0 lost acknowledged writes in the recorded run |
 
 ### Overall Conclusion
 
@@ -332,6 +516,7 @@ The benchmarks establish initial performance and behavior baselines for the self
 - **Phase 1:** The single-node RESP server achieved approximately 30k operations per second.
 - **Phase 2:** Consistent hashing reduced key movement during membership changes, with low lookup overhead and reasonably balanced key distribution.
 - **Phase 3:** The five-node cluster successfully detected a terminated node and propagated the `DEAD` state to all remaining healthy nodes in approximately 9.80 seconds.
+- **Phase 4:** The single-node benchmark showed a throughput regression after the new implementation changes. A separate five-node chaos experiment passed its acknowledged-write verification during one node failure and restart scenario.
 
 These results provide a foundation for evaluating the performance, scalability and fault tolerance of subsequent cluster implementations.
 

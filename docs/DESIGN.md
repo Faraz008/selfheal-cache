@@ -460,6 +460,284 @@ The current membership and failure-detection implementation has the following li
 - **No graceful departure announcement:** Stopping a node looks like a crash to other nodes. Graceful departure and permanent node removal are deferred to Phase 6.
 - **Imperfect failure detection:** The system cannot perfectly distinguish a crashed node from a slow or temporarily unreachable node.
 
+## 9. Survival and Recovery
+
+Phase 4 extends the cache from basic replication and failure detection to handling writes and reads while nodes are unavailable.
+
+The main mechanisms are:
+
+- Hedged reads to reduce the effect of slow replicas.
+- Read fanout to compare multiple replica responses.
+- Sloppy quorum to allow writes to use healthy stand-in nodes.
+- Hinted handoff to retain writes intended for unavailable replicas.
+- Read repair to correct stale or missing replicas.
+- Hint expiration and tombstone grace-period coordination to reduce stale-data resurrection.
+
+These mechanisms improve availability and recovery, but do not provide disk durability or eliminate every consistency gap.
+
+### 9.1 Hedged Reads
+
+A read can be delayed by a slow or unresponsive replica even when other replicas are healthy.
+
+Hedged reads reduce this delay by issuing another request when the first replica has not responded within the configured `hedge_ms` interval.
+
+The default hedge delay is 50 ms.
+
+The process is:
+
+1. The coordinator selects replicas in its read order.
+2. It sends a read request to the first replica.
+3. If that request remains pending beyond `hedge_ms`, the coordinator sends another request to the next replica while the original request is still pending.
+4. The coordinator can therefore make progress using another replica without waiting indefinitely for the slow request.
+5. Outstanding requests are cancelled or cleaned up when they are no longer needed.
+
+Hedging is a latency optimization. It does not itself guarantee that the returned value is the newest version.
+
+### 9.2 Read Fanout and Version Selection
+
+The `read_fanout` setting controls how many replica responses the coordinator consults for a read. Its default value is 2.
+
+When multiple replica records are collected, the coordinator compares their versions and selects the newest record using the LWW ordering:
+
+`(timestamp_ms, node_id)`
+
+This allows a read to prefer a newer version when replicas temporarily disagree.
+
+Hedging and read fanout serve related but different purposes:
+
+- **Hedging** controls when additional replica requests are issued to avoid waiting on a slow replica.
+- **Read fanout** controls how many replica responses are consulted.
+- **LWW version comparison** determines which record is considered newest among the records collected.
+
+A first response can trigger progress, but it should not be described as the final newest-value decision when the read is configured to compare multiple replica responses.
+
+A read that only receives one successful response cannot compare that record against replicas it did not successfully consult.
+
+### 9.3 Read Repair
+
+Read repair uses the records collected during a read to identify stale or missing replicas.
+
+The coordinator selects the newest version among the available records. If another consulted replica has an older or missing record, the coordinator sends the newer record to that replica.
+
+This allows frequently accessed keys to converge without requiring a separate full-dataset scan for every read.
+
+Read repair is opportunistic:
+
+- It can repair keys that are read.
+- It cannot guarantee recovery of keys that are never accessed.
+- It does not replace full anti-entropy synchronization.
+- It cannot restore data that has been lost everywhere.
+
+Historical catch-up synchronization for restarted nodes remains a Phase 6 responsibility.
+
+### 9.4 Sloppy Quorum and Stand-in Nodes
+
+Strict replication attempts to write to the nodes in a key's preference list.
+
+However, a preference-list owner may be unavailable before failure detection has marked it `DEAD`. Waiting for the failure detector would unnecessarily delay or reject writes.
+
+Sloppy quorum allows a write slot to be assigned to another healthy node when its intended owner is unavailable.
+
+The process is:
+
+1. The coordinator obtains the key's preference list from the consistent-hashing ring.
+2. It attempts to write the record to each preference-list owner.
+3. If an owner is already known to be `DEAD`, the coordinator skips the direct write attempt.
+4. If a direct write fails, the coordinator searches clockwise beyond the preference list for a healthy stand-in.
+5. The stand-in stores a hint identifying the intended owner and the record that must eventually be delivered to that owner.
+6. A successfully stored hint can count toward the write acknowledgement requirement.
+
+Stand-ins are selected by walking the ring beyond the original preference list. A shared iterator prevents concurrent failed write slots from selecting the same stand-in during the same replication operation.
+
+This also covers the detection window: a node can be unreachable even though membership still reports it as `ALIVE`.
+
+### 9.5 Hinted Handoff
+
+A hint represents a record that should eventually be delivered to an unavailable preference-list owner.
+
+A hint contains:
+
+- The intended owner node ID.
+- The key.
+- The versioned record to be delivered.
+
+The stand-in retains the hint until it can be replayed or until the hint expires.
+
+When the intended owner becomes available again, the stand-in sends the hinted record to that owner. The owner applies the record using the normal version comparison rules, so an older hinted record does not overwrite a newer local version.
+
+Hint replay is therefore a temporary recovery mechanism for writes made while an owner is unavailable.
+
+Hints are stored in memory in the current implementation. They are not durable.
+
+### 9.6 Hint Capacity and Expiration
+
+The hint store has a configured capacity and a hint time-to-live.
+
+When the hint store reaches its capacity:
+
+- New hints are rejected.
+- Existing hints are not silently evicted to make room.
+- A write slot that cannot store its hint does not receive an acknowledgement through that stand-in.
+
+This avoids silently discarding older recovery work in favor of newer hints.
+
+The hint lifetime must be coordinated with tombstone retention.
+
+**Hint and tombstone invariant:**
+
+`hint_ttl_ms <= tombstone_grace_ms`
+
+The tombstone grace period must be at least as long as the maximum hint lifetime. Otherwise, a tombstone could be garbage-collected while a hint capable of replaying an older value still exists.
+
+The existing grace-period assumption also requires the grace period to account for expected replica downtime:
+
+`tombstone_grace_ms > max_hint_ttl > expected_replica_downtime`
+
+The deployment configuration must satisfy the intended relationship. This document describes the invariant; it does not claim that every configuration has already been validated against it.
+
+### 9.7 Read Repair and Hinted Handoff Work Together
+
+Hinted handoff and read repair address different recovery situations.
+
+| Mechanism | Main purpose | Recovery scope |
+|---|---|---|
+| Hinted handoff | Deliver writes made while a preference-list owner was unavailable | Records for which a hint was retained |
+| Read repair | Correct stale or missing replicas discovered during reads | Keys that are read and whose replicas are consulted |
+| Phase 6 catch-up | Restore historical data to a restarted or newly joined node | Historical ownership ranges requiring synchronization |
+
+A node returning after downtime can receive writes that were hinted while it was unavailable.
+
+However, hints do not necessarily contain every record that existed before the node went down. Read repair can restore some of those records when their keys are accessed, but it is not a complete historical data transfer.
+
+### 9.8 Quorum Overlap and Consistency
+
+In strict quorum operation, read and write acknowledgement sets can overlap.
+
+For a replication factor `N`, a write quorum `W`, and a read quorum `R`, the usual overlap condition is:
+
+`R + W > N`
+
+When the read and write quorums operate over the same preference set, this overlap ensures that a successful quorum read consults at least one replica that acknowledged the write.
+
+This is the basis for the intended quorum-read visibility guarantee in strict, non-sloppy cases.
+
+However, sloppy quorum changes the acknowledgement set.
+
+A write acknowledged through a stand-in may have been stored outside the original preference list. A later read over the original preference list is not guaranteed to consult that stand-in.
+
+Therefore:
+
+- Strict quorum overlap applies when the read and write acknowledgement sets are drawn from the same preference set.
+- A sloppy-quorum acknowledgement through a stand-in does not automatically guarantee visibility to a later read over the original preference list.
+- Hint replay and read repair help close this temporary gap.
+- The system does not claim strong consistency for sloppy-quorum writes.
+
+### 9.9 Availability and the CAP Trade-off
+
+Sloppy quorum and hinted handoff favor availability when a preference-list owner is unavailable.
+
+A coordinator may acknowledge a write after a healthy stand-in has stored a hint, rather than requiring every intended owner to be directly reachable.
+
+This improves write availability, but introduces a temporary consistency gap:
+
+A write acknowledged through a stand-in may not be visible to a read that consults only the original preference-list replicas until the hint is replayed or the data is repaired.
+
+The system therefore favors availability over immediate consistency in this failure scenario.
+
+This is an explicit design trade-off, not a claim that the cache provides both perfect availability and strong consistency during partitions.
+
+### 9.10 Restarted Nodes and Recovery
+
+A node that restarts loses its local in-memory records and in-memory hints.
+
+It rejoins membership using its stable node ID and its normal membership activation process. Its ring position remains associated with that stable ID.
+
+However, it does not automatically recover all historical data in Phase 4.
+
+Recovery is limited to:
+
+1. **Hint replay:** Other nodes may deliver writes that were hinted while the node was unavailable.
+2. **Read repair:** Records can be restored when their keys are read and newer records are found on other replicas.
+
+These mechanisms do not guarantee that every pre-existing key is restored.
+
+Historical catch-up synchronization is deferred to Phase 6. Until that mechanism exists, a restarted node should not be treated as fully synchronized merely because it has returned to `ALIVE`.
+
+### 9.11 Client Retry Behavior
+
+Client retries can occur when a connection fails or a request times out, even if the server may already have processed the request.
+
+LWW versioning helps make repeated writes converge on a consistent record, but it does not provide a general exactly-once execution guarantee.
+
+For ordinary `SET` operations, retrying the same key and value creates another version containing the same value. The new version may have a later timestamp.
+
+For deletion, a repeated `DEL` produces another tombstone version.
+
+However, retries can have observable effects:
+
+- Repeating a `SET` with an expiration can calculate a new expiration deadline and extend the key's lifetime.
+- Repeating an operation creates a new version rather than reusing the original operation version.
+- `SET NX` and `SET XX` are read-then-write operations and are not atomic cluster-wide conditions.
+- Other conditional operations should not be treated as exactly-once or safely retryable without additional operation identifiers or atomic coordination.
+
+The client should therefore distinguish between an operation being safe to repeat at the value level and an operation being exactly-once.
+
+### 9.12 Failure-Mode Summary
+
+| Failure scenario | Expected behavior | Limitation |
+|---|---|---|
+| One replica fails before failure detection | Direct write may fail; a healthy stand-in can store a hint. Reads can use other reachable replicas. | The failure detector may still temporarily report the node as `ALIVE`. |
+| One replica is marked `DEAD` | The coordinator skips it and attempts a stand-in for its write slot. | A stand-in must be available and have hint capacity. |
+| Dead node returns | Membership can mark it `ALIVE`; retained hints can be replayed. Read repair can correct stale records discovered during reads. | The node may still be missing historical data. |
+| Stand-in fails before hint replay | Its in-memory hint may be lost. | Read repair can recover only keys that are subsequently read and have a newer surviving copy. |
+| No suitable stand-in exists | The coordinator cannot assign the failed write slot through hinted handoff. | The write fails if the required acknowledgement count cannot otherwise be met. |
+| Client-facing node fails | The client receives a connection error and may retry through another node. | The client cannot always know whether the original request was processed before the connection failed. |
+
+### 9.13 Phase 4 Design Decisions — Replication and Survival
+
+**Decision 1 — Hint storage is introduced before hinted handoff**
+
+Hint storage is introduced before replay because sloppy quorum cannot acknowledge a write through a stand-in unless there is somewhere to retain the record for the unavailable owner.
+
+**Decision 2 — Hedged reads**
+
+When a replica has not responded within `hedge_ms` (default 50 ms), the coordinator can ask another replica while the original request remains pending. This reduces the impact of slow replicas on read latency.
+
+**Decision 3 — Read fanout and newest-version selection**
+
+Reads consult `read_fanout` replicas (default 2) and use LWW version comparison to select the newest collected record. Read repair uses the comparison to update stale or missing replicas.
+
+The strict quorum overlap condition `R + W > N` applies to acknowledgement sets drawn from the same preference set. Sloppy-quorum stand-ins are an exception to that simple overlap argument.
+
+**Decision 4 — Stand-ins are found by walking beyond the preference list**
+
+A failed or known-dead preference-list owner can be replaced by the next healthy node found by walking the ring clockwise beyond the preference list. This also covers the time between a node becoming unreachable and the failure detector declaring it `DEAD`.
+
+**Decision 5 — Hints are in-memory only**
+
+Hints are held in memory. If a stand-in fails before replay, its hints can be lost. Read repair and Phase 6 catch-up synchronization provide additional recovery mechanisms, but read repair only repairs keys that are accessed.
+
+**Decision 6 — Hint capacity is bounded**
+
+When the hint store is full, new hints are rejected instead of silently evicting existing hints. A write slot that cannot be assigned to a direct owner or a stand-in does not receive an acknowledgement.
+
+**Decision 7 — Restarted nodes require historical catch-up**
+
+A restarted node comes back without its previous in-memory records. Hints cover writes made while it was down, while read repair can restore older records for keys that are read. Complete historical catch-up is deferred to Phase 6.
+
+### 9.14 Known Limits of Phase 4
+
+- Hints are in-memory and can be lost if their stand-in fails before replay.
+- A full hint store can prevent new hinted write slots from being acknowledged.
+- A sloppy-quorum write acknowledged through a stand-in may not be visible to a read over the original preference list until hint replay or repair.
+- Read repair is demand-driven and cannot restore keys that are never read.
+- A restarted node is not fully recovered until historical catch-up synchronization is implemented.
+- Hedged reads reduce waiting on slow replicas but do not independently guarantee the newest value.
+- LWW discards concurrent versions that lose the version comparison.
+- Client retries do not provide exactly-once execution.
+- `SET NX`, `SET XX`, `EXPIRE`, `PEXPIRE`, and `PERSIST` are not atomic cluster-wide operations.
+- There is no disk persistence, transaction support, authentication, or TLS.
+
 ---
 
 *This document describes the intended system design. Features are implemented incrementally; the current implementation may not yet provide all distributed guarantees described above.*
