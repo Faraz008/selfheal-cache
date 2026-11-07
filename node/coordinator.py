@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections import Counter
 
 from .config import NodeConfig
 from .membership import Entry, Membership
@@ -23,11 +24,18 @@ class Coordinator:
         membership: Membership,
         peers: Peers,
     ):
-        self.cfg, self.store, self.m, self.peers = cfg, store, membership, peers
+        self.cfg, self.store, self.m, self.peers = (
+            cfg,
+            store,
+            membership,
+            peers,
+        )
         self.id = cfg.node_id
         self.ring = Ring(cfg.vnodes)
         self.versions = VersionClock(self.id, store.now)
         self._bg: set[asyncio.Task] = set()
+        self.stats = Counter()
+
         self.m.subscribe(self._on_membership)
         self._on_membership(self.m.entries())  # initial sync
 
@@ -61,6 +69,14 @@ class Coordinator:
     async def close(self) -> None:
         for t in list(self._bg):
             t.cancel()
+
+    # ---- background task helper ----
+
+    def _spawn(self, coro) -> asyncio.Task:
+        t = asyncio.create_task(coro)
+        self._bg.add(t)  # strong ref: otherwise the task can be garbage-collected mid-flight
+        t.add_done_callback(self._bg.discard)
+        return t
 
     # ---- RPC handlers (this node acting as a REPLICA) ----
 
@@ -110,35 +126,111 @@ class Coordinator:
             key=self.m.read_priority,
         )
 
+    # ---- reads ----
+
+    async def _fetch(self, nid: str, key: bytes) -> Record | None:
+        """Raw record (tombstones included) from one replica. Raises RpcError."""
+        if nid == self.id:
+            return self.store.get_record(key)
+
+        d = await self.peers.call(
+            nid,
+            "get",
+            {"k": b64e(key)},
+        )
+        return None if d is None else rec_from_wire(d)
+
+    async def _gather_answers(
+        self,
+        key: bytes,
+        order: list[str],
+        want: int,
+    ):
+        """Collect `want` replica answers.
+
+        Launches the first `want` replicas at once, and one more whenever:
+        (a) a request fails, or
+        (b) nothing has answered within hedge_ms (the hedge).
+
+        Returns ({node_id: Record | None}, last_error).
+        """
+        hedge = self.cfg.hedge_ms / 1000
+        queue = list(order)
+        running: dict[asyncio.Task, str] = {}
+        answers: dict[str, Record | None] = {}
+        last_err: Exception | None = None
+
+        def launch() -> None:
+            nid = queue.pop(0)
+            running[asyncio.create_task(self._fetch(nid, key))] = nid
+
+        try:
+            for _ in range(min(want, len(queue))):
+                launch()
+
+            while len(answers) < want:
+                if not running:
+                    if not queue:
+                        break
+                    launch()
+
+                done, _ = await asyncio.wait(
+                    list(running),
+                    timeout=hedge if queue else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if not done:  # everyone in flight is slow: hedge
+                    launch()
+                    continue
+
+                for t in done:
+                    nid = running.pop(t)
+
+                    try:
+                        answers[nid] = t.result()
+                    except RpcError as e:
+                        log.warning("read from %s failed: %s", nid, e)
+                        last_err = e
+
+                        if queue:
+                            launch()
+
+        finally:
+            for t in running:
+                t.cancel()
+
+            await asyncio.gather(
+                *running,
+                return_exceptions=True,
+            )
+
+        return answers, last_err
+
+    @staticmethod
+    def newest(recs) -> Record | None:
+        found = [r for r in recs if r is not None]
+        return max(found, key=lambda r: r.version) if found else None
+
     async def read(self, key: bytes) -> Record | None:
-        """Live record or None. First replica that answers wins."""
+        """Live record or None. Day 17: first answer wins, hedged."""
         order = self.read_order(key)
 
         if not order:
             raise ClusterError("empty ring")
 
-        last_err: Exception | None = None
+        answers, err = await self._gather_answers(
+            key,
+            order,
+            1,
+        )
 
-        for nid in order:  # DEAD nodes are tried last, never skipped
-            try:
-                if nid == self.id:
-                    rec = self.store.get_record(key)
-                else:
-                    d = await self.peers.call(
-                        nid,
-                        "get",
-                        {"k": b64e(key)},
-                    )
-                    rec = None if d is None else rec_from_wire(d)
+        if not answers:
+            raise ClusterError("no replica reachable") from err
 
-            except RpcError as e:
-                log.warning("read from %s failed: %s", nid, e)
-                last_err = e
-                continue
+        best = self.newest(answers.values())
 
-            return rec if rec is not None and rec.is_live(self.now()) else None
-
-        raise ClusterError("no replica reachable") from last_err
+        return best if best is not None and best.is_live(self.now()) else None
 
     async def _put(
         self,
