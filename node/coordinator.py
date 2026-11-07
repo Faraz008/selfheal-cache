@@ -241,24 +241,26 @@ class Coordinator:
         return max(found, key=lambda r: r.version) if found else None
 
     async def read(self, key: bytes) -> Record | None:
-        """Live record or None. First successful answer wins, hedged."""
+        """Consult read_fanout replicas, return the newest version, and repair any
+        stale replica in the background."""
         order = self.read_order(key)
-
         if not order:
             raise ClusterError("empty ring")
-
-        answers, err = await self._gather_answers(
-            key,
-            order,
-            1,
-        )
-
+        want = min(self.cfg.read_fanout, len(order))
+        answers, err = await self._gather_answers(key, order, want)
         if not answers:
             raise ClusterError("no replica reachable") from err
-
         best = self.newest(answers.values())
-
+        if best is not None:
+            stale = [n for n, r in answers.items() if r is None or r.version < best.version]
+            if stale:
+                self._spawn(self._repair(key, best, stale))
         return best if best is not None and best.is_live(self.now()) else None
+
+    async def _repair(self, key: bytes, best: Record, stale: list[str]) -> None:
+        # Pushes tombstones and expired records too: that is what stops resurrection.
+        results = await asyncio.gather(*(self._put(n, key, best) for n in stale))
+        self.stats["read_repairs"] += sum(results)
 
     # ---- writes and hinted handoff ----
 

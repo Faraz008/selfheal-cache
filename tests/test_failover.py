@@ -136,3 +136,41 @@ async def test_deleted_key_is_not_resurrected_by_hint_replay(start):
 
     finally:
         c.w.close()
+
+
+async def test_read_repair_heals_replica_missing_a_write(start):
+    servers = [await start(c) for c in static_cfgs(3, replicas=3, write_acks=3, read_fanout=3)]
+    c = await connect(servers[0].port)
+    await c.cmd("SET", "k", "v")
+    servers[2].store._data.pop(b"k")  # simulate a replica that missed the write
+    assert servers[2].store.get_record(b"k") is None
+    assert await c.cmd("GET", "k") == b"v"  # client is served immediately
+
+    async def healed():
+        return servers[2].store.get_live(b"k") is not None
+
+    await eventually(healed)
+    assert servers[0].coord.stats["read_repairs"] >= 1
+
+
+async def test_read_repair_spreads_a_tombstone(start):
+    servers = [await start(c) for c in static_cfgs(3, replicas=3, write_acks=3, read_fanout=3)]
+    c = await connect(servers[0].port)
+    await c.cmd("SET", "k", "v")
+    v = servers[0].coord.versions.next()
+    tomb = Record(None, v, v[0])
+    servers[0].store.apply(b"k", tomb)
+    servers[1].store.apply(b"k", tomb)  # n3 still holds the live value
+    assert await c.cmd("GET", "k") is None
+
+    async def spread():
+        r = servers[2].store.get_record(b"k")
+        return r is not None and r.is_tombstone
+
+    await eventually(spread)
+
+
+async def test_info_command(start):
+    s = await start(static_cfgs(1)[0])
+    c = await connect(s.port)
+    assert b"read_repairs:0" in await c.cmd("INFO")

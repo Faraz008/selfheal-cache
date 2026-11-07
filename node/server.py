@@ -34,11 +34,20 @@ class Server:
 
         # ---- membership and cluster communication ----
 
-        self.membership = Membership.from_config(cfg, self.store.now)
+        self.membership = Membership.from_config(
+            cfg,
+            self.store.now,
+        )
 
-        self.peers = Peers(timeout_s=cfg.rpc_timeout_ms / 1000)
+        self.peers = Peers(
+            timeout_s=cfg.rpc_timeout_ms / 1000,
+        )
 
-        self.hints = HintStore(cfg.max_hints, cfg.hint_ttl_ms, self.store.now)
+        self.hints = HintStore(
+            cfg.max_hints,
+            cfg.hint_ttl_ms,
+            self.store.now,
+        )
 
         self.coord = Coordinator(
             cfg,
@@ -98,6 +107,7 @@ class Server:
             "PERSIST": (self.cmd_persist, 1, 1),
             "DBSIZE": (self.cmd_dbsize, 0, 0),
             "COMMAND": (self.cmd_command, 0, None),
+            "INFO": (self.cmd_info, 0, 0),
             # Membership inspection command.
             "CLUSTER": (self.cmd_cluster, 1, 1),
             # Debug commands (not part of Redis).
@@ -256,6 +266,21 @@ class Server:
 
     async def cmd_command(self, a):
         return b"*0\r\n"
+
+    async def cmd_info(self, a):
+        s = self.coord.stats
+
+        lines = [
+            f"node_id:{self.cfg.node_id}",
+            f"live_keys:{len(self.store)}",
+            f"raw_records:{self.store.raw_len()}",
+            f"hints_held:{self.hints.count}",
+            f"hints_rejected:{self.hints.rejected}",
+            f"hints_written:{s['hints_written']}",
+            f"read_repairs:{s['read_repairs']}",
+        ]
+
+        return resp.bulk(("\n".join(lines) + "\n").encode())
 
     async def cmd_cluster(self, a):
         if a[0].upper() != b"NODES":
