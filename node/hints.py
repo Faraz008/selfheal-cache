@@ -1,7 +1,12 @@
+import asyncio
 import itertools
 import logging
 
+from .config import NodeConfig
+from .membership import Membership, State
+from .rpc import Peers, RpcError
 from .store import Record, now_ms
+from .wire import b64e, rec_to_wire
 
 log = logging.getLogger("hints")
 
@@ -62,3 +67,65 @@ class HintStore:
                 del self._h[owner]
         self.count -= n
         return n
+
+
+class HintReplayer:
+    """Delivers held hints to their owner once the owner is ALIVE again."""
+
+    def __init__(self, cfg: NodeConfig, membership: Membership, peers: Peers, hints: HintStore):
+        self.cfg, self.m, self.peers, self.hints = cfg, membership, peers, hints
+        self.wake = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        membership.subscribe(self._on_change)
+
+    def _on_change(self, changed) -> None:
+        if any(e.state is State.ALIVE for e in changed):
+            self.wake.set()  # an owner just came back: replay NOW, don't wait for the timer
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+
+    async def _loop(self) -> None:
+        interval = self.cfg.hint_replay_interval_ms / 1000
+        while True:
+            try:
+                await asyncio.wait_for(self.wake.wait(), interval)
+            except TimeoutError:
+                pass
+            self.wake.clear()
+            try:
+                dropped = self.hints.expire()
+                if dropped:
+                    log.warning("dropped %d expired hints", dropped)
+                if await self.replay_once():
+                    self.wake.set()  # more may remain; go again, but pace ourselves
+                    await asyncio.sleep(0.05)
+            except Exception:
+                log.exception("hint replay failed")
+
+    async def replay_once(self) -> int:
+        sent = 0
+        for owner in self.hints.owners():
+            e = self.m.get(owner)
+            if e is None or e.state is not State.ALIVE:
+                continue  # wrong time; the hints wait
+            batch = self.hints.pending(owner, self.cfg.hint_batch)
+            if not batch:
+                continue
+            items = [{"k": b64e(k), "r": rec_to_wire(r)} for k, r in batch]
+            try:
+                await self.peers.call(owner, "put_many", {"items": items})
+            except RpcError as err:
+                log.debug("replay to %s failed: %s", owner, err)
+                continue  # keep the hints, try later
+            for k, r in batch:
+                self.hints.done(owner, k, r)
+            sent += len(batch)
+            log.info("replayed %d hints to %s", len(batch), owner)
+        return sent

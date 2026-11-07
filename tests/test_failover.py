@@ -72,3 +72,67 @@ async def test_write_still_works_after_detector_declares_death(start):
     c = await connect(servers[0].port)
     for i in range(50):
         assert await c.cmd("SET", f"k{i}", "v") == "OK"
+
+
+async def test_hint_replays_when_owner_returns(start):
+    cfgs = static_cfgs(4, replicas=2, write_acks=2)
+    servers = [await start(c) for c in cfgs]
+    n1 = servers[0]
+    key = next(
+        f"k{i}".encode() for i in range(1000) if "n4" in n1.coord.preference_list(f"k{i}".encode())
+    )
+    await servers[3].stop()
+    c = await connect(n1.port)
+    assert await c.cmd("SET", key, "v") == "OK"
+    assert sum(s.hints.count for s in servers[:3]) == 1
+
+    revived = await start(cfgs[3])  # same id, same ports: a restart
+
+    async def delivered():
+        rec = revived.store.get_live(key)
+        return rec is not None and rec.value == b"v"
+
+    await eventually(delivered, timeout=8)
+
+    async def drained():
+        return sum(s.hints.count for s in servers[:3]) == 0
+
+    await eventually(drained)
+
+
+async def test_deleted_key_is_not_resurrected_by_hint_replay(start):
+    cfgs = static_cfgs(4, replicas=2, write_acks=2)
+    servers = [await start(c) for c in cfgs]
+    n1 = servers[0]
+
+    key = next(
+        f"k{i}".encode() for i in range(1000) if "n4" in n1.coord.preference_list(f"k{i}".encode())
+    )
+
+    c = await connect(n1.port)
+
+    try:
+        await c.cmd("SET", key, "v")
+
+        old_record = servers[3].store.get_record(key)
+        assert old_record is not None
+        assert old_record.value == b"v"
+
+        await servers[3].stop()
+
+        await c.cmd("DEL", key)
+
+        revived = await start(cfgs[3])
+
+        revived.store.apply(key, old_record)
+
+        async def tombstoned():
+            r = revived.store.get_record(key)
+            return r is not None and r.is_tombstone
+
+        await eventually(tombstoned, timeout=8)
+
+        assert await c.cmd("GET", key) is None
+
+    finally:
+        c.w.close()

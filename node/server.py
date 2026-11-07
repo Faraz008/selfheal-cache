@@ -6,7 +6,7 @@ from .config import NodeConfig
 from .coordinator import ClusterError, Coordinator
 from .detector import FailureDetector
 from .gossip import Gossiper
-from .hints import HintStore
+from .hints import HintReplayer, HintStore
 from .membership import Membership
 from .rpc import Peers, RpcServer
 from .store import Store
@@ -52,6 +52,13 @@ class Server:
             cfg,
             self.membership,
             self.peers,
+        )
+
+        self.replayer = HintReplayer(
+            cfg,
+            self.membership,
+            self.peers,
+            self.hints,
         )
 
         self.detector = FailureDetector(
@@ -107,6 +114,7 @@ class Server:
         # Start membership gossip after RPC is available.
         await self.gossip.start()
         await self.detector.start()
+        await self.replayer.start()
 
         # Start the client-facing RESP server.
         self._server = await asyncio.start_server(
@@ -135,6 +143,7 @@ class Server:
 
     async def stop(self) -> None:
         # Stop gossip before shutting down internal RPC.
+        await self.replayer.stop()
         await self.detector.stop()
         await self.gossip.stop()
 
