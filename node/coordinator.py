@@ -3,6 +3,7 @@ import logging
 from collections import Counter
 
 from .config import NodeConfig
+from .hints import HintStore
 from .membership import Entry, Membership
 from .ring import Ring
 from .rpc import Peers, RpcError
@@ -23,12 +24,14 @@ class Coordinator:
         store: Store,
         membership: Membership,
         peers: Peers,
+        hints: HintStore,
     ):
-        self.cfg, self.store, self.m, self.peers = (
+        self.cfg, self.store, self.m, self.peers, self.hints = (
             cfg,
             store,
             membership,
             peers,
+            hints,
         )
         self.id = cfg.node_id
         self.ring = Ring(cfg.vnodes)
@@ -70,11 +73,17 @@ class Coordinator:
         for t in list(self._bg):
             t.cancel()
 
+        if self._bg:
+            await asyncio.gather(
+                *self._bg,
+                return_exceptions=True,
+            )
+
     # ---- background task helper ----
 
     def _spawn(self, coro) -> asyncio.Task:
         t = asyncio.create_task(coro)
-        self._bg.add(t)  # strong ref: otherwise the task can be garbage-collected mid-flight
+        self._bg.add(t)
         t.add_done_callback(self._bg.discard)
         return t
 
@@ -84,6 +93,8 @@ class Coordinator:
         return {
             "put": self._rpc_put,
             "get": self._rpc_get,
+            "hint": self._rpc_hint,
+            "put_many": self._rpc_put_many,
         }
 
     async def _rpc_put(self, a):
@@ -95,6 +106,23 @@ class Coordinator:
     async def _rpc_get(self, a):
         rec = self.store.get_record(b64d(a["k"]))
         return None if rec is None else rec_to_wire(rec)
+
+    async def _rpc_hint(self, a):
+        """Hold a write for `owner`, who is down."""
+        return self.hints.add(
+            a["o"],
+            b64d(a["k"]),
+            rec_from_wire(a["r"]),
+        )
+
+    async def _rpc_put_many(self, a):
+        return sum(
+            self.store.apply(
+                b64d(i["k"]),
+                rec_from_wire(i["r"]),
+            )
+            for i in a["items"]
+        )
 
     # ---- client-facing operations (this node acting as COORDINATOR) ----
 
@@ -213,7 +241,7 @@ class Coordinator:
         return max(found, key=lambda r: r.version) if found else None
 
     async def read(self, key: bytes) -> Record | None:
-        """Live record or None. Day 17: first answer wins, hedged."""
+        """Live record or None. First successful answer wins, hedged."""
         order = self.read_order(key)
 
         if not order:
@@ -231,6 +259,8 @@ class Coordinator:
         best = self.newest(answers.values())
 
         return best if best is not None and best.is_live(self.now()) else None
+
+    # ---- writes and hinted handoff ----
 
     async def _put(
         self,
@@ -257,6 +287,69 @@ class Coordinator:
             log.warning("put to %s failed: %s", nid, e)
             return False
 
+    def _standin_iter(self, key: bytes):
+        """Healthy nodes clockwise AFTER the preference list.
+
+        One iterator is shared by all write slots, so each failed slot
+        gets a different stand-in.
+
+        Safe to share: next() never awaits, so tasks cannot interleave
+        inside it.
+        """
+        for i, nid in enumerate(self.ring.walk(key)):
+            if i >= self.cfg.replicas and not self.m.is_dead(nid):
+                yield nid
+
+    async def _hint_to(
+        self,
+        sub: str,
+        owner: str,
+        key: bytes,
+        rec: Record,
+    ) -> bool:
+        try:
+            if sub == self.id:
+                return self.hints.add(owner, key, rec)
+
+            return bool(
+                await self.peers.call(
+                    sub,
+                    "hint",
+                    {
+                        "o": owner,
+                        "k": b64e(key),
+                        "r": rec_to_wire(rec),
+                    },
+                )
+            )
+
+        except RpcError as e:
+            log.warning(
+                "hint to %s for %s failed: %s",
+                sub,
+                owner,
+                e,
+            )
+            return False
+
+    async def _write_slot(
+        self,
+        owner: str,
+        key: bytes,
+        rec: Record,
+        standins,
+    ) -> bool:
+        """Get `rec` assigned to this owner's slot, directly or via a hint."""
+        if not self.m.is_dead(owner) and await self._put(owner, key, rec):
+            return True
+
+        for sub in standins:
+            if await self._hint_to(sub, owner, key, rec):
+                self.stats["hints_written"] += 1
+                return True
+
+        return False
+
     async def _replicate(
         self,
         key: bytes,
@@ -268,21 +361,19 @@ class Coordinator:
             raise ClusterError("empty ring")
 
         need = min(self.cfg.write_acks, len(pref))
+        standins = self._standin_iter(key)
 
-        targets = [
-            n for n in pref if not self.m.is_dead(n)
-        ]  # don't pay a timeout for a known-dead node
-
-        if len(targets) < need:
-            raise ClusterError(f"only {len(targets)} of {len(pref)} replicas alive, need {need}")
-
-        tasks = []
-
-        for nid in targets:
-            t = asyncio.create_task(self._put(nid, key, rec))
-            self._bg.add(t)
-            t.add_done_callback(self._bg.discard)
-            tasks.append(t)
+        tasks = [
+            self._spawn(
+                self._write_slot(
+                    owner,
+                    key,
+                    rec,
+                    standins,
+                )
+            )
+            for owner in pref
+        ]
 
         pending, acks = set(tasks), 0
 

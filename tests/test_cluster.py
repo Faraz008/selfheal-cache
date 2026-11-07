@@ -86,16 +86,12 @@ async def test_read_fails_over_when_primary_is_down(make):
     assert await c1.cmd("GET", key) == b"v"  # served by the second replica
 
 
-async def test_write_fails_cleanly_when_acks_unreachable(make):
-    # Documents TODAY's behavior. Phase 5 (sloppy quorum + hints) fixes it.
-    servers = await make(3, replicas=2, write_acks=2, rpc_timeout_ms=300)
+async def test_write_fails_cleanly_when_no_standin_exists(make):
+    servers = await make(2, replicas=2, write_acks=2, rpc_timeout_ms=300)
     c1 = await connect(servers[0].port)
-    key = next(
-        f"k{i}" for i in range(1000) if "n3" in servers[0].coord.preference_list(f"k{i}".encode())
-    )
-    await servers[2].stop()
+    await servers[1].stop()
     with pytest.raises(ServerError, match="CLUSTERDOWN"):
-        await c1.cmd("SET", key, "v")
+        await c1.cmd("SET", "k", "v")  # no third node to hold a hint
 
 
 async def test_delete_replicates_as_tombstone(make):

@@ -6,6 +6,7 @@ from .config import NodeConfig
 from .coordinator import ClusterError, Coordinator
 from .detector import FailureDetector
 from .gossip import Gossiper
+from .hints import HintStore
 from .membership import Membership
 from .rpc import Peers, RpcServer
 from .store import Store
@@ -37,11 +38,14 @@ class Server:
 
         self.peers = Peers(timeout_s=cfg.rpc_timeout_ms / 1000)
 
+        self.hints = HintStore(cfg.max_hints, cfg.hint_ttl_ms, self.store.now)
+
         self.coord = Coordinator(
             cfg,
             self.store,
             self.membership,
             self.peers,
+            self.hints,
         )
 
         self.gossip = Gossiper(

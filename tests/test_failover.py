@@ -47,3 +47,28 @@ async def test_read_survives_dead_replica_before_detection(start):
     await servers[1].stop()  # nobody has noticed yet
     for _ in range(20):
         assert await c.cmd("GET", "k") == b"v"
+
+
+async def test_sloppy_quorum_write_succeeds_with_dead_replica(start):
+    servers = [await start(c) for c in static_cfgs(4, replicas=2, write_acks=2)]
+    n1 = servers[0]
+    key = next(
+        f"k{i}".encode() for i in range(1000) if "n4" in n1.coord.preference_list(f"k{i}".encode())
+    )
+    await servers[3].stop()  # dead, possibly not yet detected: both paths must work
+    c = await connect(n1.port)
+    assert await c.cmd("SET", key, "v") == "OK"  # W=2 met via a stand-in
+    assert sum(s.hints.count for s in servers[:3]) == 1
+
+
+async def test_write_still_works_after_detector_declares_death(start):
+    from node.membership import State
+
+    from .conftest import sees
+
+    servers = [await start(c) for c in static_cfgs(4, replicas=2, write_acks=2)]
+    await servers[3].stop()
+    await eventually(sees(servers[0], "n4", State.DEAD), timeout=6)
+    c = await connect(servers[0].port)
+    for i in range(50):
+        assert await c.cmd("SET", f"k{i}", "v") == "OK"
