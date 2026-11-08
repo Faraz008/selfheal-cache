@@ -10,18 +10,26 @@ class State(str, Enum):
     JOINING = "joining"
     ALIVE = "alive"
     SUSPECT = "suspect"
-    LEAVING = "leaving"  # used from Phase 6
+    LEAVING = "leaving"
     DEAD = "dead"
+    LEFT = "left"  # terminal: removed from the ring
 
 
-_RANK = {State.JOINING: 0, State.ALIVE: 1, State.SUSPECT: 2, State.LEAVING: 3, State.DEAD: 4}
-# lower = try first when reading
+_RANK = {
+    State.JOINING: 0,
+    State.ALIVE: 1,
+    State.SUSPECT: 2,
+    State.LEAVING: 3,
+    State.DEAD: 4,
+    State.LEFT: 5,
+}
 _READ_PRIORITY = {
     State.ALIVE: 0,
     State.SUSPECT: 1,
     State.LEAVING: 1,
     State.JOINING: 2,
     State.DEAD: 3,
+    State.LEFT: 5,
 }
 
 
@@ -100,7 +108,9 @@ class Membership:
         return list(self._table.values())
 
     def others(self) -> list[Entry]:
-        return [e for e in self._table.values() if e.node_id != self.me]
+        return [
+            e for e in self._table.values() if e.node_id != self.me and e.state is not State.LEFT
+        ]
 
     def node_ids(self) -> list[str]:
         return sorted(self._table)
@@ -149,9 +159,12 @@ class Membership:
 
     def _refute(self, claim: Entry) -> bool:
         cur = self.self_entry
-        if cur.state is State.LEAVING:
-            return False
-        if claim.state not in (State.SUSPECT, State.DEAD) or claim.incarnation < cur.incarnation:
+        if cur.state in (State.LEAVING, State.LEFT):
+            return False  # a node that is leaving does not fight the verdict
+        if (
+            claim.state not in (State.SUSPECT, State.DEAD, State.LEFT)
+            or claim.incarnation < cur.incarnation
+        ):
             return False
         nxt = State.JOINING if cur.state is State.JOINING else State.ALIVE
         self._set(replace(cur, state=nxt, incarnation=claim.incarnation + 1))
@@ -188,3 +201,43 @@ class Membership:
     def state_of(self, node_id: str) -> State | None:
         e = self._table.get(node_id)
         return None if e is None else e.state
+
+    def ring_node_ids(self) -> list[str]:
+        """The ring is every node not LEFT. Liveness never changes it."""
+        return sorted(n for n, e in self._table.items() if e.state is not State.LEFT)
+
+    def leaving_ids(self) -> list[str]:
+        return sorted(n for n, e in self._table.items() if e.state is State.LEAVING)
+
+    def begin_leave(self) -> None:
+        cur = self.self_entry
+        if cur.state in (State.LEAVING, State.LEFT):
+            return
+        e = replace(cur, state=State.LEAVING)  # same incarnation; rank 3 outranks ALIVE/SUSPECT
+        self._set(e)
+        self._notify([e])
+
+    def finish_leave(self) -> None:
+        cur = self.self_entry
+        if cur.state is State.LEAVING:
+            e = replace(cur, state=State.LEFT)
+            self._set(e)
+            self._notify([e])
+
+    def cancel_leave(self) -> None:
+        """Failed leave: go back to ALIVE. A bumped incarnation outranks the LEAVING rumor."""
+        cur = self.self_entry
+        if cur.state is State.LEAVING:
+            e = replace(cur, state=State.ALIVE, incarnation=cur.incarnation + 1)
+            self._set(e)
+            self._notify([e])
+
+    def forget(self, node_id: str) -> bool:
+        """Operator removal of a node that will never return."""
+        cur = self._table.get(node_id)
+        if cur is None or node_id == self.me or cur.state is State.LEFT:
+            return False
+        e = replace(cur, state=State.LEFT)
+        self._set(e)
+        self._notify([e])
+        return True

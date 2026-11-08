@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from collections import Counter
 
 from .config import NodeConfig
@@ -39,27 +40,36 @@ class Coordinator:
         self._bg: set[asyncio.Task] = set()
         self.stats = Counter()
 
+        self.ring_after: Ring | None = None  # ring minus LEAVING nodes; None if nobody is leaving
+        self.ring_version = 0
+        self.ring_changed_at = time.monotonic()
         self.m.subscribe(self._on_membership)
         self._on_membership(self.m.entries())  # initial sync
 
     def _on_membership(self, changed: list[Entry]) -> None:
         for e in changed:
-            log.info(
-                "member %s -> %s (inc %d)",
-                e.node_id,
-                e.state.value,
-                e.incarnation,
-            )
-            if e.node_id != self.id:
+            log.info("member %s -> %s (inc %d)", e.node_id, e.state.value, e.incarnation)
+            if e.node_id != self.id and e.state is not State.LEFT:
                 self.peers.set_addr(e.node_id, e.host, e.rpc_port)
-
-        ids = self.m.node_ids()
-
-        # Ring membership == "ever seen and not removed".
-        # Liveness is NOT part of it.
+        ids = self.m.ring_node_ids()  # everything not LEFT; liveness is NOT part of it
+        leaving = set(self.m.leaving_ids())
+        bumped = False
         if ids != self.ring.nodes:
             self.ring.set_nodes(ids)
             log.info("ring rebuilt: %s", ids)
+            bumped = True
+        after_ids = [i for i in ids if i not in leaving] if leaving else None
+        if after_ids != (self.ring_after.nodes if self.ring_after is not None else None):
+            if after_ids is None:
+                self.ring_after = None
+            else:
+                self.ring_after = Ring(self.cfg.vnodes)
+                self.ring_after.set_nodes(after_ids)
+            log.info("leaving: %s", sorted(leaving))
+            bumped = True
+        if bumped:
+            self.ring_version += 1
+            self.ring_changed_at = time.monotonic()
 
     # ---- helpers ----
 
@@ -295,17 +305,20 @@ class Coordinator:
             log.warning("put to %s failed: %s", nid, e)
             return False
 
+    def extras(self, key: bytes, pref: list[str]) -> list[str]:
+        """Nodes that WILL own this key once leaving nodes are gone. They get the write
+        now (best effort, not counted toward W) so the handoff has no gap."""
+        if self.ring_after is None:
+            return []
+        return [
+            n for n in self.ring_after.get_preference_list(key, self.cfg.replicas) if n not in pref
+        ]
+
     def _standin_iter(self, key: bytes):
-        """Healthy nodes clockwise AFTER the preference list.
-
-        One iterator is shared by all write slots, so each failed slot
-        gets a different stand-in.
-
-        Safe to share: next() never awaits, so tasks cannot interleave
-        inside it.
-        """
+        """Healthy SERVING nodes clockwise after the preference list (hints die with
+        their holder, so never park one on a joining or leaving node)."""
         for i, nid in enumerate(self.ring.walk(key)):
-            if i >= self.cfg.replicas and not self.m.is_dead(nid):
+            if i >= self.cfg.replicas and self.m.state_of(nid) in (State.ALIVE, State.SUSPECT):
                 yield nid
 
     async def _hint_to(
@@ -369,6 +382,11 @@ class Coordinator:
             raise ClusterError("empty ring")
 
         need = min(self.cfg.write_acks, len(pref))
+
+        for n in self.extras(key, pref):
+            if not self.m.is_dead(n):
+                self._spawn(self._put(n, key, rec))
+
         standins = self._standin_iter(key)
 
         tasks = [

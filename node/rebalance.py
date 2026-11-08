@@ -1,4 +1,3 @@
-# ruff: noqa: F401
 import asyncio
 import itertools
 import logging
@@ -159,6 +158,7 @@ class Rebalancer:
                 pass
 
     async def start(self) -> None:
+        self._tasks.append(asyncio.create_task(self._cleanup_loop()))
         if self.cfg.sync_on_start and not self.cfg.seeds and len(self.cfg.member_list()) > 1:
             # Static-member node (re)booting: it is ALIVE immediately, so refill in the background.
             self._tasks.append(asyncio.create_task(self._startup_sync()))
@@ -251,3 +251,170 @@ class Rebalancer:
 
     async def _startup_sync(self) -> None:
         await self._sync_until_done()
+
+    # ---- handoff: the one primitive behind both cleanup and leave ----
+    async def _handoff(self, batch: list[tuple[bytes, Record, list[str]]]) -> int:
+        """Confirm every owner holds each record (pushing what is missing), then drop
+        our copy. A record is dropped ONLY if every one of its owners confirmed."""
+        ok = [bool(owners) for _, _, owners in batch]  # no owners at all: never drop
+        by_owner: dict[str, list[int]] = {}
+        for i, (_, _, owners) in enumerate(batch):
+            for o in owners:
+                by_owner.setdefault(o, []).append(i)
+
+        async def confirm(owner: str, idxs: list[int]) -> None:
+            if self.m.is_dead(owner):
+                for i in idxs:
+                    ok[i] = False
+                return
+            try:
+                have = await self.peers.call(
+                    owner,
+                    "have_many",
+                    {
+                        "items": [
+                            {
+                                "k": b64e(batch[i][0]),
+                                "ts": batch[i][1].version[0],
+                                "n": batch[i][1].version[1],
+                            }
+                            for i in idxs
+                        ]
+                    },
+                    timeout=5,
+                )
+                missing = [i for i, h in zip(idxs, have) if not h]
+                if missing:
+                    await self.peers.call(
+                        owner,
+                        "put_many",
+                        {
+                            "items": [
+                                {"k": b64e(batch[i][0]), "r": rec_to_wire(batch[i][1])}
+                                for i in missing
+                            ]
+                        },
+                        timeout=10,
+                    )
+                    self.stats["keys_pushed"] += len(missing)
+            except RpcError as e:
+                log.debug("handoff to %s unconfirmed: %s", owner, e)
+                for i in idxs:
+                    ok[i] = False
+
+        await asyncio.gather(*(confirm(o, ix) for o, ix in by_owner.items()))
+        dropped = 0
+        for good, (k, rec, _) in zip(ok, batch):
+            if good and self.store.drop_if_version(k, rec.version):
+                dropped += 1
+        self.stats["keys_cleaned"] += dropped
+        return dropped
+
+    async def _drain(self, owners_of) -> tuple[int, int]:
+        """Walk every record; for those whose owners (per `owners_of`) exclude us, hand
+        them off. Returns (examined, dropped)."""
+        batch: list[tuple[bytes, Record, list[str]]] = []
+        examined = dropped = 0
+        for i, k in enumerate(self.store.keys_snapshot()):
+            owners = owners_of(k)
+            if self.id not in owners:
+                rec = self.store.transferable(k)
+                if rec is not None:
+                    batch.append((k, rec, owners))
+            if len(batch) >= self.cfg.cleanup_batch:
+                examined += len(batch)
+                dropped += await self._handoff(batch)
+                await self.pacer.take(len(batch))
+                batch = []
+            if i % 2000 == 1999:
+                await asyncio.sleep(0)
+        if batch:
+            examined += len(batch)
+            dropped += await self._handoff(batch)
+        return examined, dropped
+
+    # ---- cleanup after a ring change ----
+    def request_cleanup(self) -> None:
+        self._dirty = True
+
+    def _cleanup_due(self) -> bool:
+        c = self.coord
+        if self.m.self_entry.state is not State.ALIVE or c.ring_after is not None:
+            return False
+        if any(e.state is State.JOINING for e in self.m.entries()):
+            return False  # a joiner may still be pulling from us
+        if time.monotonic() - c.ring_changed_at < self.cfg.cleanup_delay_ms / 1000:
+            return False
+        return self._dirty or c.ring_version != self._clean_version
+
+    async def cleanup_once(self) -> tuple[int, int]:
+        version = self.coord.ring_version
+        self._dirty = False
+
+        def owners_of(k: bytes) -> list[str]:
+            pref = self.coord.preference_list(k)
+            return pref + self.coord.extras(k, pref)
+
+        examined, dropped = await self._drain(owners_of)
+        if dropped < examined:
+            self._dirty = True  # some owner was unreachable: retry next round
+        else:
+            self._clean_version = version
+        if examined:
+            log.info(
+                "cleanup: %d records no longer ours, %d handed off and dropped", examined, dropped
+            )
+        return examined, dropped
+
+    async def _cleanup_loop(self) -> None:
+        interval = self.cfg.cleanup_interval_ms / 1000
+        while True:
+            await asyncio.sleep(interval)
+            self._reap_sessions()
+            try:
+                if self._cleanup_due():
+                    await self.cleanup_once()
+            except Exception:
+                log.exception("cleanup failed")
+
+    # ---- graceful leave ----
+    async def leave(self) -> None:
+        """Announce LEAVING, hand every record to its future owners, then become LEFT.
+        On failure we revert to ALIVE, so the node is never stuck half-gone."""
+        st = self.m.self_entry.state
+        if self._leaving or st is State.LEFT:
+            raise RebalanceError("already leaving")
+        if st is State.JOINING:
+            raise RebalanceError("still joining")
+        if not [n for n in self.coord.ring.nodes if n != self.id]:
+            raise RebalanceError("cannot leave: this is the only node")
+        self._leaving = True
+        try:
+            self.m.begin_leave()  # gossip carries it; peers start double-writing
+            await asyncio.sleep(self.cfg.rebalance_settle_ms / 1000)
+            deadline = time.monotonic() + self.cfg.leave_timeout_ms / 1000
+            n = self.cfg.replicas
+            while True:
+                after = self.coord.ring_after
+                if after is None or not len(after):
+                    raise RebalanceError("no node left to take the data")
+                examined, dropped = await self._drain(
+                    lambda k, ring=after: ring.get_preference_list(k, n)
+                )
+                log.info("leave pass: %d records examined, %d handed off", examined, dropped)
+                if examined == 0:  # a full pass found nothing left to hand off
+                    break
+                if time.monotonic() > deadline:
+                    raise RebalanceError(f"handoff incomplete: {examined - dropped} records remain")
+                if dropped < examined:
+                    await asyncio.sleep(0.2)
+            self.m.finish_leave()
+            for _ in range(3):  # push the LEFT verdict out before we go
+                await self.gossip.gossip_round()
+                await asyncio.sleep(self.cfg.gossip_interval_ms / 2000)
+            log.info("left the cluster")
+        except BaseException:
+            self.m.cancel_leave()  # no-op if we already reached LEFT
+            raise
+        finally:
+            self._leaving = False

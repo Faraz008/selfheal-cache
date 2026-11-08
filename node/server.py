@@ -7,8 +7,8 @@ from .coordinator import ClusterError, Coordinator
 from .detector import FailureDetector
 from .gossip import Gossiper
 from .hints import HintReplayer, HintStore
-from .membership import Membership
-from .rebalance import Rebalancer  # NEW
+from .membership import Membership, State
+from .rebalance import RebalanceError, Rebalancer
 from .rpc import Peers, RpcServer
 from .store import Store
 
@@ -71,7 +71,7 @@ class Server:
             self.hints,
         )
 
-        # NEW: Rebalancer initialization
+        # Rebalancer initialization
         self.rebalancer = Rebalancer(
             cfg,
             self.store,
@@ -97,7 +97,7 @@ class Server:
                 **self.coord.handlers(),
                 **self.gossip.handlers(),
                 **self.detector.handlers(),
-                **self.rebalancer.handlers(),  # NEW
+                **self.rebalancer.handlers(),
             },
         )
 
@@ -106,6 +106,9 @@ class Server:
         self._server: asyncio.Server | None = None
         self._sweeper: asyncio.Task | None = None
         self._writers: set[asyncio.StreamWriter] = set()
+
+        # Signals that this node has completed graceful leave.
+        self.left = asyncio.Event()
 
         # Command name: (handler, minimum arguments, maximum arguments)
         self._table = {
@@ -122,8 +125,7 @@ class Server:
             "DBSIZE": (self.cmd_dbsize, 0, 0),
             "COMMAND": (self.cmd_command, 0, None),
             "INFO": (self.cmd_info, 0, 0),
-            # Membership inspection command.
-            "CLUSTER": (self.cmd_cluster, 1, 1),
+            "CLUSTER": (self.cmd_cluster, 1, 2),
             # Debug commands (not part of Redis).
             "WHERE": (self.cmd_where, 1, 1),
             "LOCALGET": (self.cmd_localget, 1, 1),
@@ -140,7 +142,7 @@ class Server:
         await self.detector.start()
         await self.replayer.start()
 
-        # NEW: Start rebalancing after hint replay starts.
+        # Start rebalancing after hint replay starts.
         await self.rebalancer.start()
 
         # Start the client-facing RESP server.
@@ -169,7 +171,7 @@ class Server:
         return self._server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
-        # NEW: Stop rebalancer first.
+        # Stop rebalancer first.
         await self.rebalancer.stop()
 
         # Stop gossip before shutting down internal RPC.
@@ -300,23 +302,65 @@ class Server:
             f"read_repairs:{s['read_repairs']}",
         ]
 
-        return resp.bulk(("\n".join(lines) + "\n").encode())
+        r = self.rebalancer.stats
 
-    async def cmd_cluster(self, a):
-        if a[0].upper() != b"NODES":
-            raise CommandError("ERR unknown CLUSTER subcommand")
-
-        lines = [
-            f"{e.node_id} {e.host}:{e.port} "
-            f"{e.state.value} {e.incarnation}"
-            + (" myself" if e.node_id == self.cfg.node_id else "")
-            for e in sorted(
-                self.membership.entries(),
-                key=lambda e: e.node_id,
-            )
+        lines += [
+            f"state:{self.membership.self_entry.state.value}",
+            f"ring_nodes:{len(self.coord.ring)}",
+            f"keys_received:{r['keys_received']}",
+            f"keys_sent:{r['keys_sent']}",
+            f"keys_pushed:{r['keys_pushed']}",
+            f"keys_cleaned:{r['keys_cleaned']}",
         ]
 
         return resp.bulk(("\n".join(lines) + "\n").encode())
+
+    async def cmd_cluster(self, a):
+        sub = a[0].upper()
+
+        if sub == b"NODES" and len(a) == 1:
+            lines = [
+                f"{e.node_id} {e.host}:{e.port} {e.state.value} {e.incarnation}"
+                + (" myself" if e.node_id == self.cfg.node_id else "")
+                for e in sorted(
+                    self.membership.entries(),
+                    key=lambda e: e.node_id,
+                )
+            ]
+
+            return resp.bulk(("\n".join(lines) + "\n").encode())
+
+        if sub == b"LEAVE" and len(a) == 1:
+            # Blocks until the handoff is complete.
+            try:
+                await self.rebalancer.leave()
+            except RebalanceError as e:
+                raise CommandError(f"ERR {e}") from None
+
+            self.left.set()
+            return resp.OK
+
+        if sub == b"FORGET" and len(a) == 2:
+            nid = a[1].decode("utf-8", "replace")
+            st = self.membership.state_of(nid)
+
+            if st is None:
+                raise CommandError("ERR unknown node")
+
+            if nid == self.cfg.node_id or st not in (State.DEAD, State.LEAVING):
+                raise CommandError("ERR node is not dead (use CLUSTER LEAVE on a live node)")
+
+            self.membership.forget(nid)
+            return resp.OK
+
+        if sub == b"SYNC" and len(a) == 1:
+            # Re-pull every range this node owns.
+            try:
+                return resp.integer(await self.rebalancer.catch_up())
+            except RebalanceError as e:
+                raise CommandError(f"ERR {e}") from None
+
+        raise CommandError("ERR unknown CLUSTER subcommand")
 
     async def cmd_get(self, a):
         rec = await self.coord.read(a[0])

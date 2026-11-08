@@ -153,3 +153,54 @@ def test_activate_bumps_incarnation(clock):
     j = Membership(replace(entry("me", inc=10), state=State.JOINING), clock=clock)
     j.activate()
     assert j.self_entry.state is State.ALIVE and j.self_entry.incarnation == 11
+
+
+def test_left_outranks_dead_and_is_terminal(m):
+    m.merge([entry("a", State.DEAD, 5)])
+    m.merge([entry("a", State.LEFT, 5)])
+    assert m.get("a").state is State.LEFT
+    m.merge([entry("a", State.ALIVE, 5), entry("a", State.DEAD, 5)])
+    assert m.get("a").state is State.LEFT
+    m.merge([entry("a", State.JOINING, 6)])  # same id restarting: a fresh life
+    assert m.get("a").state is State.JOINING
+
+
+def test_left_nodes_leave_the_ring_and_the_peer_list(m):
+    m.merge([entry("a"), entry("b", State.LEFT, 3)])
+    assert m.ring_node_ids() == ["a", "me"]
+    assert [e.node_id for e in m.others()] == ["a"]
+    assert m.get("b") is not None  # the tombstone stays so gossip can't resurrect it
+
+
+def test_leave_lifecycle(m):
+    m.begin_leave()
+    assert m.self_entry.state is State.LEAVING and m.self_entry.incarnation == 100
+    assert m.leaving_ids() == ["me"]
+    m.finish_leave()
+    assert m.self_entry.state is State.LEFT
+    m.cancel_leave()  # too late: no-op
+    assert m.self_entry.state is State.LEFT
+
+
+def test_cancel_leave_returns_to_alive_above_the_rumor(m):
+    m.begin_leave()
+    m.cancel_leave()
+    assert m.self_entry.state is State.ALIVE and m.self_entry.incarnation == 101
+
+
+def test_leaving_node_does_not_refute_accusations(m):
+    m.begin_leave()
+    m.merge([entry("me", State.DEAD, 100)])
+    assert m.self_entry.state is State.LEAVING
+
+
+def test_forgetting_a_live_node_is_refuted_by_that_node():
+    a = Membership(entry("a", inc=7))
+    a.merge([entry("a", State.LEFT, 7)])
+    assert a.self_entry.state is State.ALIVE and a.self_entry.incarnation == 8
+
+
+def test_forget(m):
+    m.merge([entry("a", State.DEAD, 2)])
+    assert m.forget("a") and m.get("a").state is State.LEFT
+    assert not m.forget("me") and not m.forget("ghost")
