@@ -17,7 +17,13 @@ async def make():
         members = [f"n{i + 1}@127.0.0.1:{p}:{r}" for i, (p, r) in enumerate(ports)]
         servers = []
         for i, (p, r) in enumerate(ports):
-            cfg = NodeConfig(node_id=f"n{i + 1}", port=p, rpc_port=r, members=members, **over)
+            cfg = NodeConfig(
+                node_id=f"n{i + 1}",
+                port=p,
+                rpc_port=r,
+                members=members,
+                **{"sync_on_start": False, **over},
+            )
             s = Server(cfg)
             await s.start()
             servers.append(s)

@@ -70,6 +70,33 @@ class NodeConfig:
     hint_batch: int = 200
     hint_replay_interval_ms: int = 1000
 
+    # Rebalancing and data transfer
+    rebalance_settle_ms: int = 3000
+    # Wait after join/leave announcement before moving data.
+
+    transfer_batch: int = 500
+    # Records per stream page.
+
+    transfer_rate: int = 5000
+    # Records/sec cap for any transfer; 0 = unlimited.
+
+    join_max_wait_ms: int = 60_000
+    # Give up waiting for sources after this and go ALIVE anyway.
+
+    sync_on_start: bool = True
+    # Static-member nodes catch up from peers at boot.
+
+    # Cleanup
+    cleanup_interval_ms: int = 5000
+    cleanup_delay_ms: int = 10_000
+    # Quiet period after a ring change before cleanup runs.
+
+    cleanup_batch: int = 200
+
+    # Graceful leave and sessions
+    leave_timeout_ms: int = 120_000
+    session_ttl_ms: int = 60_000
+
     log_level: str = "INFO"
 
     def member_list(self) -> list[Member]:
@@ -157,6 +184,10 @@ class NodeConfig:
 
         if self.hint_ttl_ms > self.tombstone_grace_ms:
             raise SystemExit("hint_ttl_ms must be <= tombstone_grace_ms (resurrection risk)")
+
+        # Validate data transfer and cleanup configuration.
+        if self.transfer_batch < 1 or self.cleanup_batch < 1:
+            raise SystemExit("transfer_batch and cleanup_batch must be >= 1")
 
     @classmethod
     def load(cls, argv: list[str] | None = None) -> "NodeConfig":

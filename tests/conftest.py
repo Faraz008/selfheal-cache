@@ -103,6 +103,14 @@ FAST = dict(
     hedge_ms=30,
 )
 
+FAST.update(
+    rebalance_settle_ms=150,
+    transfer_rate=0,
+    join_max_wait_ms=8000,
+    leave_timeout_ms=10_000,
+    sync_on_start=False,
+)
+
 
 def static_cfgs(n: int, **over) -> list[NodeConfig]:
     ports = [(free_port(), free_port()) for _ in range(n)]
