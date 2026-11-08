@@ -8,6 +8,7 @@ from .detector import FailureDetector
 from .gossip import Gossiper
 from .hints import HintReplayer, HintStore
 from .membership import Membership
+from .rebalance import Rebalancer  # NEW
 from .rpc import Peers, RpcServer
 from .store import Store
 
@@ -70,6 +71,16 @@ class Server:
             self.hints,
         )
 
+        # NEW: Rebalancer initialization
+        self.rebalancer = Rebalancer(
+            cfg,
+            self.store,
+            self.membership,
+            self.coord,
+            self.peers,
+            self.gossip,
+        )
+
         self.detector = FailureDetector(
             cfg,
             self.membership,
@@ -84,6 +95,7 @@ class Server:
                 **self.coord.handlers(),
                 **self.gossip.handlers(),
                 **self.detector.handlers(),
+                **self.rebalancer.handlers(),  # NEW
             },
         )
 
@@ -126,6 +138,9 @@ class Server:
         await self.detector.start()
         await self.replayer.start()
 
+        # NEW: Start rebalancing after hint replay starts.
+        await self.rebalancer.start()
+
         # Start the client-facing RESP server.
         self._server = await asyncio.start_server(
             self._handle,
@@ -152,6 +167,9 @@ class Server:
         return self._server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
+        # NEW: Stop rebalancer first.
+        await self.rebalancer.stop()
+
         # Stop gossip before shutting down internal RPC.
         await self.replayer.stop()
         await self.detector.stop()

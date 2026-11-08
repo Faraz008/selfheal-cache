@@ -102,3 +102,29 @@ class Store:
             if len(dead) * 4 <= len(keys):
                 break
         return removed
+
+    def keys_snapshot(self) -> list[bytes]:
+        """A copy, so callers can iterate across awaits while writes continue."""
+        return list(self._data)
+
+    def transferable(self, key: bytes) -> Record | None:
+        """The record to ship during rebalancing, or None to skip it.
+        - already collectable (past expire_at + grace): skip
+        - expired value: ship as a bare tombstone (same version, no payload); it still
+          blocks resurrection but the expired bytes never cross the network."""
+        rec = self._data.get(key)
+        now = self.now()
+        if rec is None or self._collectable(rec, now):
+            return None
+        if rec.value is not None and not rec.is_live(now):
+            return Record(None, rec.version, rec.expire_at)
+        return rec
+
+    def drop_if_version(self, key: bytes, version: Version) -> bool:
+        """Delete only if the record is still exactly this version. A newer write that
+        arrived meanwhile must survive."""
+        cur = self._data.get(key)
+        if cur is None or cur.version != version:
+            return False
+        self._remove(key)
+        return True

@@ -1,0 +1,169 @@
+# ruff: noqa: F401
+import asyncio
+import itertools
+import logging
+import time
+from collections import Counter
+
+from .config import NodeConfig
+from .coordinator import Coordinator
+from .gossip import Gossiper
+from .membership import Membership, State
+from .ring import Move, RangeSet, Ring, hash64, ring_diff
+from .rpc import Peers, RpcError
+from .store import Record, Store
+from .wire import b64d, b64e, rec_from_wire, rec_to_wire
+
+log = logging.getLogger("rebalance")
+
+
+class RebalanceError(Exception):
+    pass
+
+
+class SyncError(RebalanceError):
+    """Could not pull every range we are responsible for (yet)."""
+
+
+class Pacer:
+    """Caps AVERAGE throughput (records/sec) so a transfer never starves live traffic."""
+
+    def __init__(self, rate: int):
+        self.rate = rate
+        self._ready = 0.0  # monotonic time by which everything taken so far is 'paid for'
+
+    async def take(self, n: int) -> None:
+        if self.rate <= 0 or n <= 0:
+            return
+        now = time.monotonic()
+        self._ready = max(self._ready, now) + n / self.rate  # idle time is not banked
+        delay = self._ready - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+class _Session:
+    __slots__ = ("keys", "pos", "touched")
+
+    def __init__(self, keys: list[bytes]):
+        self.keys, self.pos, self.touched = keys, 0, time.monotonic()
+
+
+class Rebalancer:
+    def __init__(
+        self,
+        cfg: NodeConfig,
+        store: Store,
+        membership: Membership,
+        coord: Coordinator,
+        peers: Peers,
+        gossiper: Gossiper,
+    ):
+        self.cfg, self.store, self.m, self.coord = cfg, store, membership, coord
+        self.peers, self.gossip = peers, gossiper
+        self.id = cfg.node_id
+        self.pacer = Pacer(cfg.transfer_rate)
+        self.stats: Counter = Counter()
+        self._sessions: dict[int, _Session] = {}
+        self._sids = itertools.count(1)
+        self._tasks: list[asyncio.Task] = []
+        self._leaving = False
+        self._clean_version = -1
+        self._dirty = False
+
+    def handlers(self):
+        return {
+            "stream_open": self._rpc_open,
+            "stream_next": self._rpc_next,
+            "stream_close": self._rpc_close,
+            "have_many": self._rpc_have,
+        }
+
+    # ---- source side of a stream ----
+    async def _scan(self, rs: RangeSet) -> list[bytes]:
+        """Keys whose hash falls in rs. Yields to the loop regularly: a big scan must
+        never freeze client traffic."""
+        out: list[bytes] = []
+        for i, k in enumerate(self.store.keys_snapshot()):
+            if hash64(k) in rs:
+                out.append(k)
+            if i % 2000 == 1999:
+                await asyncio.sleep(0)
+        return out
+
+    def _reap_sessions(self) -> None:
+        cutoff = time.monotonic() - self.cfg.session_ttl_ms / 1000
+        for sid, s in list(self._sessions.items()):
+            if s.touched < cutoff:
+                del self._sessions[sid]
+
+    async def _rpc_open(self, a):
+        self._reap_sessions()
+        rs = RangeSet([(lo, hi) for lo, hi in a["ranges"]])
+        keys = await self._scan(rs)
+        sid = next(self._sids)
+        self._sessions[sid] = _Session(keys)
+        return {"sid": sid, "total": len(keys)}
+
+    async def _rpc_next(self, a):
+        s = self._sessions.get(a["sid"])
+        if s is None:
+            raise RebalanceError("unknown or expired stream session")
+        s.touched = time.monotonic()
+        end = min(s.pos + a["n"], len(s.keys))
+        items = []
+        for k in s.keys[s.pos : end]:  # read the CURRENT record, not a stale snapshot
+            rec = self.store.transferable(k)
+            if rec is not None:
+                items.append({"k": b64e(k), "r": rec_to_wire(rec)})
+        s.pos = end
+        done = s.pos >= len(s.keys)
+        if done:
+            del self._sessions[a["sid"]]
+        self.stats["keys_sent"] += len(items)
+        return {"items": items, "done": done}
+
+    async def _rpc_close(self, a):
+        self._sessions.pop(a["sid"], None)
+        return True
+
+    async def _rpc_have(self, a):
+        """For each (key, version): do we hold that version or newer?"""
+        out = []
+        for it in a["items"]:
+            rec = self.store.get_record(b64d(it["k"]))
+            out.append(rec is not None and rec.version >= (it["ts"], it["n"]))
+        return out
+
+    # ---- puller side of a stream ----
+    async def _pull_from(self, src: str, ranges: list[tuple[int, int]]) -> int:
+        """Stream every record in `ranges` from src into our store (LWW-merged).
+        Idempotent: running it twice, or racing live writes, is harmless."""
+        opened = await self.peers.call(src, "stream_open", {"ranges": ranges}, timeout=30)
+        sid, got = opened["sid"], 0
+        try:
+            while True:
+                res = await self.peers.call(
+                    src, "stream_next", {"sid": sid, "n": self.cfg.transfer_batch}, timeout=10
+                )
+                for it in res["items"]:
+                    self.store.apply(b64d(it["k"]), rec_from_wire(it["r"]))
+                got += len(res["items"])
+                if res["done"]:
+                    return got
+                await self.pacer.take(len(res["items"]))  # receiver-side rate limit
+        finally:
+            try:
+                await self.peers.call(src, "stream_close", {"sid": sid}, timeout=1)
+            except RpcError:
+                pass
+
+    # lifecycle (extended on Days 24 and 25)
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()

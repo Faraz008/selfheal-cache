@@ -124,3 +124,33 @@ def test_version_clock_follows_wall_clock(clock):
     a = vc.next()
     clock.advance(100)
     assert vc.next()[0] - a[0] == 100
+
+
+def test_transferable_ships_expired_value_as_bare_tombstone(store, clock):
+    t = clock()
+    store.apply(b"a", rec(b"secret", t, exp=t + 100))
+    clock.advance(200)
+    r = store.transferable(b"a")
+    assert r.value is None and r.version == (t, "n1") and r.expire_at == t + 100
+    clock.advance(1000)  # now past the grace
+    assert store.transferable(b"a") is None
+
+
+def test_transferable_ships_live_values_untouched(store, clock):
+    store.apply(b"a", rec(b"1", 10))
+    assert store.transferable(b"a").value == b"1"
+    assert store.transferable(b"missing") is None
+
+
+def test_drop_if_version_only_drops_that_exact_version(store):
+    store.apply(b"a", rec(b"1", 10))
+    assert store.drop_if_version(b"a", (11, "n1")) is False
+    assert store.drop_if_version(b"a", (10, "n1")) is True
+    assert store.get_record(b"a") is None
+
+
+def test_keys_snapshot_is_a_copy(store):
+    store.apply(b"a", rec(b"1", 10))
+    snap = store.keys_snapshot()
+    store.apply(b"b", rec(b"1", 10))
+    assert snap == [b"a"]
