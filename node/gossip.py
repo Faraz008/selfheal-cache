@@ -21,6 +21,7 @@ class Gossiper:
 
         self._task: asyncio.Task | None = None
         self._boot: asyncio.Task | None = None
+        self.on_bootstrapped = None
 
     def handlers(self):
         return {"gossip": self._rpc_gossip}
@@ -88,13 +89,11 @@ class Gossiper:
                 # Merge the membership information returned by the seed.
                 self.m.merge([Entry.from_wire(d) for d in res["members"]])
 
-                # Activate only after successfully discovering the cluster.
-                # Phase 6 will move activation until after data streaming.
                 if self.m.self_entry.state is State.JOINING:
-                    self.m.activate()
-
-                log.info("joined via seed %s:%d", host, port)
-                return
+                    if self.on_bootstrapped is not None:
+                        await self.on_bootstrapped()  # Phase 6: pull data first, activate last
+                    else:
+                        self.m.activate()
 
             # No seed answered. Retry with exponential backoff.
             await asyncio.sleep(delay)

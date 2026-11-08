@@ -81,6 +81,8 @@ class Server:
             self.gossip,
         )
 
+        self.gossip.on_bootstrapped = self.rebalancer.join
+
         self.detector = FailureDetector(
             cfg,
             self.membership,

@@ -4,7 +4,7 @@ from collections import Counter
 
 from .config import NodeConfig
 from .hints import HintStore
-from .membership import Entry, Membership
+from .membership import Entry, Membership, State
 from .ring import Ring
 from .rpc import Peers, RpcError
 from .store import Record, Store, VersionClock
@@ -144,15 +144,17 @@ class Coordinator:
             Record(None, v, v[0]),
         )  # tombstone
 
-    def read_order(self, key: bytes) -> list[str]:
-        """Preference list, best candidates first: ALIVE, SUSPECT, JOINING, DEAD.
+    def read_plan(self, key: bytes) -> tuple[list[str], int]:
+        """(candidates best-first, number of JOINING replicas). While a replica is joining
+        it may hold the only copy of a fresh W=1 write but lacks old data, so we ask it
+        AND widen the candidate list with the displaced old replica."""
+        pref = self.preference_list(key)
+        joining = sum(1 for n in pref if self.m.state_of(n) is State.JOINING)
+        cands = self.ring.get_preference_list(key, self.cfg.replicas + joining) if joining else pref
+        return sorted(cands, key=self.m.read_priority), joining
 
-        sorted() is stable, so ring order is preserved within each class.
-        """
-        return sorted(
-            self.preference_list(key),
-            key=self.m.read_priority,
-        )
+    def read_order(self, key: bytes) -> list[str]:
+        return self.read_plan(key)[0]
 
     # ---- reads ----
 
@@ -241,18 +243,22 @@ class Coordinator:
         return max(found, key=lambda r: r.version) if found else None
 
     async def read(self, key: bytes) -> Record | None:
-        """Consult read_fanout replicas, return the newest version, and repair any
-        stale replica in the background."""
-        order = self.read_order(key)
+        order, joining = self.read_plan(key)
         if not order:
             raise ClusterError("empty ring")
-        want = min(self.cfg.read_fanout, len(order))
+        want = min(self.cfg.read_fanout + joining, len(order))
         answers, err = await self._gather_answers(key, order, want)
         if not answers:
             raise ClusterError("no replica reachable") from err
         best = self.newest(answers.values())
         if best is not None:
-            stale = [n for n, r in answers.items() if r is None or r.version < best.version]
+            owners = set(self.preference_list(key))
+            # repair OWNERS only: the displaced old replica must not be handed a stray copy
+            stale = [
+                n
+                for n, r in answers.items()
+                if n in owners and (r is None or r.version < best.version)
+            ]
             if stale:
                 self._spawn(self._repair(key, best, stale))
         return best if best is not None and best.is_live(self.now()) else None

@@ -158,12 +158,96 @@ class Rebalancer:
             except RpcError:
                 pass
 
-    # lifecycle (extended on Days 24 and 25)
     async def start(self) -> None:
-        pass
+        if self.cfg.sync_on_start and not self.cfg.seeds and len(self.cfg.member_list()) > 1:
+            # Static-member node (re)booting: it is ALIVE immediately, so refill in the background.
+            self._tasks.append(asyncio.create_task(self._startup_sync()))
 
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+    # ---- planning ----
+    def _my_moves(self) -> list[Move]:
+        """Ranges where I am a replica now but would not be if I did not exist.
+        For a brand-new node that is its new ranges; for a restarted node, all of them."""
+        others = [n for n in self.coord.ring.nodes if n != self.id]
+        without_me = Ring(self.cfg.vnodes)
+        without_me.set_nodes(others)
+        moves = ring_diff(without_me, self.coord.ring, self.cfg.replicas)
+        return [mv for mv in moves if self.id in mv.gained]
+
+    def _sources(self, mv: Move) -> list[str]:
+        """Live nodes that hold this range: current owners first, then old owners."""
+        out: list[str] = []
+        for n in (*mv.new, *mv.old):
+            if (
+                n != self.id
+                and n not in out
+                and self.m.state_of(n) in (State.ALIVE, State.SUSPECT, State.LEAVING)
+            ):
+                out.append(n)
+        return sorted(out, key=self.m.read_priority)  # stable: ALIVE first
+
+    async def catch_up(self) -> int:
+        """Pull every range this node is responsible for from a live replica.
+        Returns records received. Raises SyncError if some range has no reachable source."""
+        work: list[tuple[Move, list[str]]] = []
+        for mv in self._my_moves():
+            cands = self._sources(mv)
+            if cands:
+                work.append((mv, cands))
+            elif len(self.coord.ring) > 1:
+                raise SyncError(f"no live source for range {mv.lo:016x}-{mv.hi:016x}")
+        total = 0
+        queue = [(mv, cands, 0) for mv, cands in work]
+        while queue:
+            groups: dict[str, list] = {}
+            for mv, cands, i in queue:
+                groups.setdefault(cands[i], []).append((mv, cands, i))
+            queue = []
+            for src, items in groups.items():  # one stream session per source
+                try:
+                    total += await self._pull_from(src, [(mv.lo, mv.hi) for mv, _, _ in items])
+                except RpcError as e:
+                    log.warning("pull from %s failed: %s", src, e)
+                    for mv, cands, i in items:
+                        if i + 1 >= len(cands):
+                            raise SyncError(f"all sources failed for range {mv.lo:016x}") from e
+                        queue.append((mv, cands, i + 1))  # next candidate for those ranges
+        self.stats["keys_received"] += total
+        return total
+
+    async def _sync_until_done(self) -> None:
+        deadline = time.monotonic() + self.cfg.join_max_wait_ms / 1000
+        delay = 0.2
+        while True:
+            try:
+                n = await self.catch_up()
+                log.info("sync complete: %d records pulled", n)
+                return
+            except SyncError as e:
+                if time.monotonic() >= deadline:
+                    # Availability over completeness: a cache may start with gaps.
+                    # Read repair and `CLUSTER SYNC` heal them.
+                    log.error(
+                        "sync incomplete after %dms (%s); continuing", self.cfg.join_max_wait_ms, e
+                    )
+                    return
+                log.warning("sync retry in %.1fs: %s", delay, e)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5.0)
+
+    # ---- join ----
+    async def join(self) -> None:
+        """Called by the gossiper once a seed answered. We are JOINING: in the ring and
+        receiving writes, but not trusted for reads until our data is here."""
+        await asyncio.sleep(self.cfg.rebalance_settle_ms / 1000)  # let our arrival spread
+        await self._sync_until_done()
+        self.m.activate()
+        log.info("join complete: ALIVE holding %d records", self.store.raw_len())
+
+    async def _startup_sync(self) -> None:
+        await self._sync_until_done()

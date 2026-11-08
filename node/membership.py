@@ -184,3 +184,7 @@ class Membership:
             e = replace(cur, state=State.ALIVE, incarnation=cur.incarnation + 1)
             self._set(e)
             self._notify([e])
+
+    def state_of(self, node_id: str) -> State | None:
+        e = self._table.get(node_id)
+        return None if e is None else e.state
