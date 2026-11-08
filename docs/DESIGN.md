@@ -42,6 +42,7 @@ Nodes use distributed failure detection and anti-entropy mechanisms to identify 
 - **No transactions:** Multiple operations are not guaranteed to execute atomically as a single transaction.
 - **No default strong consistency:** The default operating mode provides eventual consistency with LWW conflict resolution. Strong consistency is not guaranteed unless quorum mode is enabled.
 - **No protection against every failure scenario:** Recovery and availability depend on the number of surviving replicas and the ability of nodes to communicate.
+- **No exactly-once execution:** Client retries can repeat operations. Versioning helps replicas converge but does not provide general exactly-once semantics.
 
 ## 5. Assumptions
 
@@ -148,7 +149,7 @@ The ring's `_rebuild` operation has complexity:
 
 where `V` is the total number of virtual nodes.
 
-Rebuilding happens only when membership changes, not on every request.
+Rebuilding happens when the set of ring-eligible membership entries changes, not on every request.
 
 Ring lookups use binary search and have complexity:
 
@@ -160,13 +161,15 @@ This keeps key ownership lookup efficient as the number of virtual nodes grows.
 
 Membership liveness and ring ownership are separate concerns.
 
-A node becoming `DEAD` does not remove it from the consistent-hashing ring. The ring preserves its ownership position, while routing and replica selection skip `DEAD` nodes and continue to eligible nodes.
+A node becoming `SUSPECT` or `DEAD` does not remove it from the consistent-hashing ring. The ring preserves its ownership position, while routing and replica selection skip unavailable nodes and continue to eligible nodes.
 
-Keeping dead nodes in the ring prevents temporary failures or flapping nodes from repeatedly rebuilding the ring and reshuffling key ownership.
+Keeping temporarily failed nodes in the ring prevents transient failures or flapping nodes from repeatedly rebuilding the ring and reshuffling key ownership.
 
 A returning node with the same stable node ID retains its original ring position.
 
-Permanent node removal and ownership redistribution are deferred to Phase 6.
+Permanent removal is an explicit membership and rebalancing operation. A node that completes graceful departure reaches `LEFT` and is excluded from the active ring.
+
+The ring therefore changes because of explicit join, leave, or forget operations—not merely because a node's liveness changes.
 
 ## 8. Membership and Failure Detection
 
@@ -191,21 +194,26 @@ Node IDs must remain stable and unique across restarts. Changing a node ID makes
 
 ### 8.2 Membership States
 
-Nodes can have one of five membership states:
+Nodes can have six membership states:
 
 | State | Rank | Meaning |
 |---|---:|---|
-| `JOINING` | 0 | A newly discovered node that has not completed cluster activation. |
+| `JOINING` | 0 | A newly discovered node that has not completed cluster activation and data synchronization. |
 | `ALIVE` | 1 | A node currently considered healthy and available. |
 | `SUSPECT` | 2 | A node that has failed direct and indirect probing and may be unavailable. |
-| `LEAVING` | 3 | A node preparing to leave the cluster. Reserved for Phase 6. |
+| `LEAVING` | 3 | A node preparing to leave the cluster and hand off its data. |
 | `DEAD` | 4 | A node declared unavailable after its suspicion timeout expires. |
+| `LEFT` | 5 | A node that has completed graceful departure or has been explicitly forgotten. It is excluded from the active ring. |
 
 The state precedence order is:
 
-`JOINING < ALIVE < SUSPECT < LEAVING < DEAD`
+`JOINING < ALIVE < SUSPECT < LEAVING < DEAD < LEFT`
 
-The rank is used when resolving membership updates with equal incarnation numbers. It does not mean that a `DEAD` node is permanently removed from the ring.
+The rank is used when resolving membership updates with equal incarnation numbers.
+
+`LEFT` is terminal for that membership entry. A stale `ALIVE`, `SUSPECT`, or `DEAD` update must not bring a deliberately removed node back into the ring.
+
+A node that has crashed unexpectedly is detected through `SUSPECT` and `DEAD`. A node that has completed a graceful departure is represented by `LEFT`.
 
 ### 8.3 Membership Merge Rules and Precedence
 
@@ -229,10 +237,13 @@ For example:
 | `(10, DEAD)` | `(11, ALIVE)` | `(11, ALIVE)` |
 | `(10, SUSPECT)` | `(10, ALIVE)` | `(10, SUSPECT)` |
 | `(10, DEAD)` | `(10, ALIVE)` | `(10, DEAD)` |
+| `(10, DEAD)` | `(10, LEFT)` | `(10, LEFT)` |
 
-This makes the merge operation commutative, associative, and idempotent, assuming endpoint metadata is consistent. Gossip messages can arrive out of order or be duplicated without preventing membership convergence.
+This makes the merge operation commutative, associative, and idempotent under the membership ordering, assuming endpoint metadata is consistent.
 
 Node endpoint metadata (`host`, `port`, and `rpc_port`) is treated as immutable for a given node ID. Conflicting endpoint metadata for an existing node ID is rejected rather than silently merged.
+
+`LEFT` is a deliberate terminal membership state. A normal self-refutation must not override it. Reintroducing a deliberately removed node requires an explicit administrative or new-join operation rather than ordinary gossip.
 
 ### 8.4 Incarnation Numbers and Self-Refutation
 
@@ -249,6 +260,8 @@ When a node receives a `SUSPECT` or `DEAD` claim about itself with an incarnatio
 The higher incarnation ensures that the refutation supersedes the older accusation across the cluster.
 
 The node itself is the authority on its own membership state. Remote membership updates about the local node are never directly adopted; they are processed through the refutation mechanism.
+
+A `LEFT` entry is different from an ordinary failure accusation and is not refuted through this mechanism.
 
 **Restart assumption:** Boot-time incarnation numbers assume the wall clock does not move backwards across restarts. A manual clock rewind or a restart after an incarnation has been increased substantially through refutation can cause a new incarnation to be lower than an older one. Incarnation persistence is not implemented in the current design.
 
@@ -313,27 +326,27 @@ If both direct and indirect probing fail:
 
 ```text
 Direct ping fails
-       |
-       v
+      |
+      v
 Indirect probes fail
-       |
-       v
+      |
+      v
 Target becomes SUSPECT
-       |
-       +------------------------------+
-       |                              |
-       v                              v
-Target refutes accusation       Suspicion timeout expires
-       |                              |
-       v                              v
-Incarnation increases           Target becomes DEAD
-       |                              |
-       v                              v
-ALIVE entry is gossiped          DEAD entry is gossiped
-       |                              |
-       v                              v
-Other nodes converge             Other nodes converge
-on newer ALIVE state              on DEAD state
+      |
+      +------------------------------+
+      |                              |
+      v                              v
+Target refutes accusation     Suspicion timeout expires
+      |                              |
+      v                              v
+Incarnation increases        Target becomes DEAD
+      |                              |
+      v                              v
+ALIVE entry is gossiped      DEAD entry is gossiped
+      |                              |
+      v                              v
+Other nodes converge         Other nodes converge
+on newer ALIVE state         on DEAD state
 ```
 
 A successful self-refutation uses a higher incarnation number, so the new `ALIVE` entry supersedes the older `SUSPECT` or `DEAD` entry.
@@ -363,7 +376,7 @@ A node can start with a static membership configuration or use seed addresses to
 
 - **Static bootstrap:** Configured members are initially added to the local membership table as `ALIVE` entries with incarnation zero. The local node starts with its own boot-time incarnation.
 - **Seed-based bootstrap:** A node with no static member list but configured seed addresses starts in `JOINING` state and contacts seed nodes through the internal RPC interface to discover existing membership information.
-- **Activation:** A `JOINING` node transitions to `ALIVE` when cluster activation completes. Activation increments its incarnation so that its `ALIVE` entry supersedes stale membership information.
+- **Activation:** A `JOINING` node transitions to `ALIVE` when cluster activation and required synchronization complete, or when the configured join wait limit is reached with incomplete synchronization. The latter case is an availability trade-off described in Section 10.
 
 Seeds are initial discovery contacts, not permanent coordinators. Membership is subsequently learned and maintained through gossip.
 
@@ -373,31 +386,29 @@ Membership and consistent-hashing ring ownership are separate concerns.
 
 A node becoming `DEAD` does not remove it from the consistent-hashing ring. Membership records its liveness, while the ring preserves its ownership position.
 
-Routing and replica selection skip `DEAD` nodes and continue to the next eligible nodes when selecting replicas.
+Routing and replica selection skip unavailable nodes and continue to eligible nodes when selecting replicas.
 
 Keeping `DEAD` nodes in the ring prevents temporary failures or flapping nodes from repeatedly rebuilding the ring and reshuffling key ownership.
 
-The ring changes only when a node appears for the first time. A returning node with the same stable node ID retains its original ring position.
-
-Permanent node removal and ring ownership redistribution are explicit operations deferred to Phase 6.
+A node that completes graceful departure becomes `LEFT` and is removed from the active ring. This is an explicit ownership change, not a consequence of ordinary liveness detection.
 
 ### 8.11 Dynamic Join and Data Migration
 
 A newly discovered node is added to the membership table and consistent-hashing ring when it joins the cluster.
 
-However, historical keys belonging to the new node's ownership ranges are not automatically transferred during Phase 4.
+However, historical keys belonging to the new node's ownership ranges must be transferred before the node can be treated as fully synchronized.
 
-Consequently, reads for existing keys that are now assigned to the new node may temporarily miss until data migration and synchronization are implemented in Phase 6.
+The Phase 6 rebalancer implements this transfer. During the join, the node remains `JOINING`. It can participate in write paths so that writes are not lost while ownership is changing, but it is demoted in read preference until its synchronization is complete.
 
-Dynamic membership therefore changes ownership before it guarantees that the new owner has received the corresponding historical data.
+If synchronization does not finish within `join_max_wait_ms`, the node can become `ALIVE` with gaps. This preserves availability at the cost of temporarily incomplete historical data. The incomplete state is logged as an error and can be repaired through read repair and `CLUSTER SYNC`.
 
 ### 8.12 Graceful Shutdown
 
-The current `stop()` operation does not announce a graceful departure to the cluster.
+A normal process stop is detected through the existing failure-detection mechanism.
 
-From the perspective of other nodes, a stopped node behaves like a crashed node and is detected through normal probing and suspicion.
+A graceful departure uses the explicit `LEAVING` state and Phase 6 handoff protocol. The leaving node transfers its records to the future owners before becoming `LEFT`.
 
-The `LEAVING` state is defined in the membership model but is not actively used until Phase 6, when graceful departure and permanent membership removal are implemented.
+If a graceful leave cannot complete, the node can revert to `ALIVE` with a newer incarnation so that peers stop treating it as a continuing departure.
 
 ### 8.13 Expected Failure Detection Time
 
@@ -418,7 +429,7 @@ The expected total failure detection time is approximately 6–8 seconds, target
 
 ### 8.14 Seven Phase 4 Design Decisions
 
-The following decisions define the scope and behavior of membership and failure detection in this phase.
+The following decisions define the scope and behavior of membership and failure detection in Phase 4.
 
 **Decision 1 — SWIM-style direct and indirect probing**
 
@@ -426,7 +437,7 @@ A node first attempts a direct ping. If it fails, the node asks two helper nodes
 
 **Decision 2 — Membership liveness is separate from ring ownership**
 
-`DEAD` nodes remain in the consistent-hashing ring. Routing skips dead nodes, but their ownership positions are preserved. Temporary failures and recovery therefore do not repeatedly reshuffle the ring. Permanent removal is deferred to Phase 6.
+`DEAD` nodes remain in the consistent-hashing ring. Routing skips dead nodes, but their ownership positions are preserved. Temporary failures and recovery therefore do not repeatedly reshuffle the ring. Permanent removal is an explicit Phase 6 operation.
 
 **Decision 3 — Boot-time incarnation numbers**
 
@@ -436,13 +447,13 @@ A node initializes its incarnation using the boot-time Unix timestamp in millise
 
 Nodes exchange their complete membership tables during gossip. This is simple and appropriate for the expected cluster size of approximately 50 nodes. Bounded dissemination is a possible future improvement for larger clusters.
 
-**Decision 5 — Dynamic join without historical data migration**
+**Decision 5 — Dynamic join with historical data migration deferred**
 
-A joining node is added to membership and the ring, but historical keys are not moved automatically in this phase. Reads for affected keys may temporarily miss until data migration and synchronization are implemented in Phase 6.
+A joining node is added to membership and the ring, but historical keys are not moved automatically in Phase 4. Reads for affected keys may temporarily miss data until Phase 6 implements synchronization.
 
-**Decision 6 — Shutdown behaves like a crash**
+**Decision 6 — Shutdown and graceful departure are separate**
 
-The current `stop()` operation does not announce graceful departure. Other nodes detect the stopped process through normal failure detection. The `LEAVING` state is reserved for Phase 6.
+An ordinary `stop()` does not announce graceful departure. Other nodes detect the stopped process through normal failure detection. The `LEAVING` state is used by the Phase 6 graceful departure protocol.
 
 **Decision 7 — Failure detection timing target**
 
@@ -453,12 +464,11 @@ With a 1000 ms probe interval and a 5000 ms suspicion timeout, the expected fail
 The current membership and failure-detection implementation has the following limitations:
 
 - **Small-cluster gossip:** Full-table gossip is intended for clusters of roughly 50 nodes. It is not optimized for large-scale membership dissemination.
-- **No automatic data movement on join:** A newly joined node changes ring ownership, but historical data is not migrated until Phase 6. Reads may temporarily miss data during this period.
 - **Wall-clock restart assumption:** A restarted node relies on the wall clock not having moved backwards. Incarnation persistence is not implemented.
 - **Eventual membership convergence:** Nodes may temporarily maintain different views of cluster state.
 - **Local suspicion timers:** Timers can expire at different times because nodes may learn about suspicions at different times.
-- **No graceful departure announcement:** Stopping a node looks like a crash to other nodes. Graceful departure and permanent node removal are deferred to Phase 6.
 - **Imperfect failure detection:** The system cannot perfectly distinguish a crashed node from a slow or temporarily unreachable node.
+- **In-memory state:** Membership and data are not backed by durable storage.
 
 ## 9. Survival and Recovery
 
@@ -509,8 +519,6 @@ Hedging and read fanout serve related but different purposes:
 - **Read fanout** controls how many replica responses are consulted.
 - **LWW version comparison** determines which record is considered newest among the records collected.
 
-A first response can trigger progress, but it should not be described as the final newest-value decision when the read is configured to compare multiple replica responses.
-
 A read that only receives one successful response cannot compare that record against replicas it did not successfully consult.
 
 ### 9.3 Read Repair
@@ -528,7 +536,9 @@ Read repair is opportunistic:
 - It does not replace full anti-entropy synchronization.
 - It cannot restore data that has been lost everywhere.
 
-Historical catch-up synchronization for restarted nodes remains a Phase 6 responsibility.
+Read repair is restricted to the relevant preference-list replicas. During a join, it does not treat every temporary read candidate as a permanent owner.
+
+Historical catch-up synchronization for restarted nodes is handled by Phase 6.
 
 ### 9.4 Sloppy Quorum and Stand-in Nodes
 
@@ -652,16 +662,13 @@ A node that restarts loses its local in-memory records and in-memory hints.
 
 It rejoins membership using its stable node ID and its normal membership activation process. Its ring position remains associated with that stable ID.
 
-However, it does not automatically recover all historical data in Phase 4.
-
 Recovery is limited to:
 
 1. **Hint replay:** Other nodes may deliver writes that were hinted while the node was unavailable.
 2. **Read repair:** Records can be restored when their keys are read and newer records are found on other replicas.
+3. **Phase 6 catch-up:** The restarted node pulls historical records from available replicas before serving as a fully synchronized owner.
 
-These mechanisms do not guarantee that every pre-existing key is restored.
-
-Historical catch-up synchronization is deferred to Phase 6. Until that mechanism exists, a restarted node should not be treated as fully synchronized merely because it has returned to `ALIVE`.
+A restarted node must not be treated as fully synchronized merely because it has returned to `ALIVE`. The Phase 6 join process keeps it in `JOINING` while it performs catch-up, subject to the configured join wait limit.
 
 ### 9.11 Client Retry Behavior
 
@@ -723,7 +730,7 @@ When the hint store is full, new hints are rejected instead of silently evicting
 
 **Decision 7 — Restarted nodes require historical catch-up**
 
-A restarted node comes back without its previous in-memory records. Hints cover writes made while it was down, while read repair can restore older records for keys that are read. Complete historical catch-up is deferred to Phase 6.
+A restarted node comes back without its previous in-memory records. Hints cover writes made while it was down, while read repair can restore older records for keys that are read. Complete historical catch-up is handled by Phase 6.
 
 ### 9.14 Known Limits of Phase 4
 
@@ -731,12 +738,321 @@ A restarted node comes back without its previous in-memory records. Hints cover 
 - A full hint store can prevent new hinted write slots from being acknowledged.
 - A sloppy-quorum write acknowledged through a stand-in may not be visible to a read over the original preference list until hint replay or repair.
 - Read repair is demand-driven and cannot restore keys that are never read.
-- A restarted node is not fully recovered until historical catch-up synchronization is implemented.
+- A restarted node is not fully recovered until historical catch-up synchronization completes.
 - Hedged reads reduce waiting on slow replicas but do not independently guarantee the newest value.
 - LWW discards concurrent versions that lose the version comparison.
 - Client retries do not provide exactly-once execution.
 - `SET NX`, `SET XX`, `EXPIRE`, `PEXPIRE`, and `PERSIST` are not atomic cluster-wide operations.
 - There is no disk persistence, transaction support, authentication, or TLS.
+
+## 10. Rebalancing
+
+Phase 6 introduces explicit ownership changes and historical data movement. It handles three operations:
+
+1. A new node joining or a previously failed node restarting.
+2. An existing node gracefully leaving the cluster.
+3. Cleanup and removal of records from nodes that no longer own those records.
+
+The goal is to change ownership without unnecessarily interrupting client traffic or deleting the last available copy of a record.
+
+### 10.1 Phase 6 Design Decisions
+
+The following decisions define the rebalancing protocol.
+
+**Decision 1 — Pull-based join**
+
+A joining node pulls the records it needs from existing live replicas. It does not depend on a single permanent source. If a source fails during a pull, it tries the next candidate source.
+
+**Decision 2 — Settle window**
+
+The join process waits for a settle window of approximately three gossip rounds before treating the membership view as stable enough to calculate the ownership transition.
+
+The configured `rebalance_settle_ms` represents this delay.
+
+This relies on the assumption that no coordinator remains partitioned from gossip for longer than `rebalance_settle_ms`. The settle period reduces the chance of a coordinator continuing to use a stale membership view, but it is not a consensus protocol and cannot eliminate arbitrary network partitions.
+
+**Decision 3 — Joining nodes participate in writes**
+
+A `JOINING` node is included in write paths so that it can receive current updates while historical records are being transferred.
+
+It is demoted in read paths until synchronization is complete. This prevents clients from preferentially reading from a node whose historical dataset may still contain gaps.
+
+**Decision 4 — Reads are widened during join**
+
+During a join, read candidates are widened to include the joining node and the displaced old replica. This helps reads find records while ownership is transitioning.
+
+Read repair remains restricted to the key's preference-list nodes. Temporary read candidates are not automatically treated as permanent owners.
+
+**Decision 5 — Double-writes during leave**
+
+While a node is `LEAVING`, writes are sent both to the normal preference list and to the future owners in `ring_after`.
+
+These additional writes are best-effort and are not counted toward the configured write acknowledgement requirement `W`.
+
+This allows the future owners to receive newer versions while the leaving node is draining its existing records.
+
+**Decision 6 — Confirmation before deletion**
+
+An old owner must not delete a record merely because a transfer was attempted.
+
+Deletion requires confirmation from every relevant current owner that it holds a version at least as new as the old owner's version.
+
+If an owner is unreachable or cannot confirm possession of a sufficiently new version, the old record is retained and cleanup is retried.
+
+**Decision 7 — `LEFT` is terminal**
+
+A node that completes graceful departure becomes `LEFT`. `LEFT` ranks above `DEAD` and is excluded from the active ring.
+
+Ordinary liveness changes never rebuild the ring. Explicit join, graceful leave, and administrative forget operations change ring eligibility.
+
+**Decision 8 — Forget does not automatically redistribute data**
+
+`CLUSTER FORGET <id>` explicitly removes a permanently dead or leaving node from membership and the ring.
+
+It does not itself transfer or recreate all missing replicas. The operator must run `CLUSTER SYNC` on surviving nodes to restore the desired number of copies.
+
+**Decision 9 — Expired values are transferred as bare tombstones**
+
+An expired record is not transferred as an ordinary live value. It is shipped as a bare tombstone so that the expired value cannot become visible again on a new owner.
+
+**Decision 10 — Stream sessions are in-memory**
+
+Rebalancing stream sessions are held in memory. They are not durable across process restarts. A restarted joiner starts a fresh join and pulls the required data again.
+
+**Decision 11 — Restarted nodes pull before serving**
+
+A restarted node must perform catch-up before it is treated as a fully synchronized owner. It starts in `JOINING` and pulls its historical ownership ranges before normal read preference is restored.
+
+**Decision 12 — Bounded join wait favors availability**
+
+If synchronization cannot complete before `join_max_wait_ms`, the node is allowed to become `ALIVE` with incomplete data rather than remain unavailable indefinitely.
+
+The incomplete synchronization is logged as an error. Read repair and a later `CLUSTER SYNC` can repair missing records.
+
+This is an explicit availability trade-off, not a guarantee that the node is fully synchronized when it becomes `ALIVE`.
+
+### 10.2 Flow One — Join and Restart
+
+A new node or restarted node must obtain the records belonging to its ownership ranges before it becomes a normal read target.
+
+The join flow is:
+
+1. The node starts and is represented as `JOINING`.
+2. Membership information is exchanged through gossip.
+3. The node waits for the configured settle window, approximately three gossip rounds.
+4. The coordinator calculates the ownership changes between the current ring and the ring including the joining node.
+5. The joining node identifies the ranges it needs to receive.
+6. It selects a live existing replica as a source and requests the relevant records.
+7. Records are streamed in batches and applied using normal version comparison rules.
+8. If a source becomes unavailable during the pull, the joiner switches to the next candidate source for the affected ranges.
+9. Writes continue to include the joining node, so updates made during synchronization can reach it.
+10. Reads are widened to include the joining node and displaced old replicas, while the joining node remains demoted in normal read preference.
+11. When synchronization completes, the node transitions to `ALIVE`.
+12. If synchronization cannot complete within `join_max_wait_ms`, the node can transition to `ALIVE` with gaps. The incomplete synchronization is logged as an error.
+
+A restarted node follows the same catch-up process. Its stable node ID preserves its ring identity, but its in-memory records are not assumed to have survived the restart.
+
+**Join invariant:** A node must not be treated as a fully synchronized read owner merely because it has been discovered through gossip or inserted into the ring.
+
+### 10.3 Flow Two — Graceful Leave
+
+A graceful departure transfers records to the future owners before the departing node is removed from the ring.
+
+The leave flow is:
+
+1. The node receives `CLUSTER LEAVE`.
+2. It transitions to `LEAVING`.
+3. The rebalancer calculates the future ownership arrangement using `ring_after`, which excludes the leaving node.
+4. While it remains `LEAVING`, writes are double-written to the normal owners and the future owners.
+5. The additional writes to future owners are best-effort and do not count toward `W`.
+6. The leaving node scans its local records and identifies the future owners for each key.
+7. It transfers records to those owners.
+8. Future owners apply received records using normal version comparison.
+9. The leaving node completes the handoff and transitions to `LEFT`.
+10. `LEFT` is disseminated through membership gossip and the node is excluded from the active ring.
+
+If the handoff fails or times out, the node reverts to `ALIVE` with a bumped incarnation. This allows peers to distinguish the new active membership state from the previous leave attempt.
+
+A graceful leave must not be considered complete while required handoff work remains unresolved.
+
+**Leave invariant:** A node is not removed from the active ring until its graceful leave protocol completes and it reaches `LEFT`.
+
+### 10.4 Flow Three — Cleanup and Ownership Confirmation
+
+After a join or leave, some nodes may retain records that no longer belong to them.
+
+Cleanup removes these obsolete copies only after confirming that the current owners have sufficiently new versions.
+
+The cleanup flow is:
+
+1. The old owner scans records that are no longer in its ownership responsibility.
+2. It determines the current owners for each key.
+3. It checks whether every required current owner has a record with a version greater than or equal to the old owner's version.
+4. If all owners confirm, the old owner can safely remove its obsolete copy.
+5. If an owner is unreachable, missing the record, or has an older version, deletion is deferred.
+6. Cleanup retries after `cleanup_interval_ms`.
+
+This confirmation prevents the old owner from deleting the last available copy merely because a transfer was attempted.
+
+Expired records are handled specially. An expired value is transferred as a bare tombstone rather than as a live value.
+
+**Cleanup invariant:** An old owner may delete a record only after all required current owners confirm that they hold a version at least as new as the record being deleted.
+
+### 10.5 Rebalancing Invariants
+
+The rebalancing implementation relies on the following invariants.
+
+**Invariant 1 — Liveness does not change ring ownership**
+
+A node becoming `SUSPECT` or `DEAD` does not automatically change the consistent-hashing ring.
+
+The ring changes only through explicit ownership and membership operations such as join, graceful leave, and administrative forget.
+
+**Invariant 2 — Deletion requires owner confirmation**
+
+An old owner cannot delete a record simply because it has sent the record to another node.
+
+Every required current owner must confirm that it holds a version at least as new as the old owner's record. If confirmation is unavailable, the record remains stored.
+
+**Invariant 3 — `JOINING` nodes participate in writes but are demoted in reads**
+
+The joining node receives writes during its synchronization period so that updates are not missed while historical data is being transferred.
+
+It is demoted in read preference until synchronization completes. During the transition, reads are widened to include the joining node and the displaced old replica.
+
+**Invariant 4 — `LEAVING` nodes are double-written**
+
+While a node is `LEAVING`, writes are sent to both the normal preference list and future owners in `ring_after`.
+
+The extra future-owner writes are best-effort and do not count toward `W`.
+
+**Invariant 5 — Read repair targets preference-list nodes**
+
+Read repair is restricted to the key's preference-list nodes. A temporary read candidate does not automatically become a permanent repair target.
+
+**Invariant 6 — `LEFT` is terminal**
+
+A gracefully departed node is represented by `LEFT`, which ranks above `DEAD` and is excluded from the active ring.
+
+**Invariant 7 — Expired values cannot be revived by transfer**
+
+Expired records are shipped as bare tombstones. Rebalancing must not transfer an expired value as an ordinary live record.
+
+**Invariant 8 — Synchronization sessions are not durable**
+
+Stream sessions are in-memory. If a joiner crashes, the session is lost and a restarted node begins a fresh join.
+
+### 10.6 Settle-Window Assumption
+
+The join and ownership-transition logic relies on membership gossip to disseminate the new node's membership state.
+
+Before calculating and acting on the ownership transition, the rebalancer waits for the configured settle period:
+
+`rebalance_settle_ms`
+
+The intended settle period is approximately three gossip rounds.
+
+The design assumes:
+
+`No coordinator is partitioned from gossip for longer than rebalance_settle_ms`
+
+This is an operational assumption, not a consensus guarantee.
+
+If a coordinator remains partitioned from gossip beyond the settle window, it may continue operating with an outdated membership view. In that case, it may not include the joining node in its write paths during part of the join.
+
+Such missed writes are expected to be repaired through subsequent cleanup's `have_many` confirmation process and read repair, provided that a sufficiently new copy still exists on a reachable replica.
+
+The settle window reduces the probability of this condition but cannot eliminate it under arbitrary network partitions.
+
+### 10.7 Incomplete Synchronization and `join_max_wait_ms`
+
+A joining node normally remains `JOINING` while it pulls its required historical data.
+
+However, a source may be unavailable, a network connection may repeatedly fail, or every candidate source for a range may be unreachable.
+
+The joiner retries source selection and transfer with backoff.
+
+If synchronization remains incomplete after `join_max_wait_ms`, the node is allowed to transition to `ALIVE` with gaps.
+
+This is an explicit availability trade-off:
+
+- Keeping the node in `JOINING` indefinitely would delay its normal activation.
+- Allowing it to become `ALIVE` makes it available to the cluster but does not prove that its historical dataset is complete.
+- The incomplete synchronization is logged as an error.
+- Read repair can repair keys that are subsequently read.
+- `CLUSTER SYNC` can be used to retry historical catch-up.
+
+Therefore:
+
+`ALIVE` does not necessarily mean that every historical record has been synchronized if the join wait limit was reached.
+
+The system favors continued availability over indefinite blocking of node activation.
+
+### 10.8 Failure-Mode Table
+
+| Situation | What happens |
+|---|---|
+| Source dies mid-pull | The joiner switches those ranges to the next candidate source. |
+| Every source unreachable | Retries with backoff until `join_max_wait_ms`, then goes `ALIVE` with gaps (logged as an error); read repair and `CLUSTER SYNC` heal. |
+| Joiner crashes mid-pull | Detector marks it `SUSPECT` then `DEAD`; a restart is a fresh join with a newer incarnation. |
+| Leaver crashes mid-drain | Stays `LEAVING` (peers keep double-writing); restart it or run `CLUSTER FORGET <id>`. |
+| Leave handoff fails or times out | Reverts to `ALIVE` with a bumped incarnation; safe to retry. |
+| Owner unreachable during cleanup | Record is kept; retried every `cleanup_interval_ms`. |
+| Dead node permanently removed | Run `CLUSTER FORGET <id>`; then run `CLUSTER SYNC` on the survivors to restore N copies. |
+| Coordinator unaware of a joiner for longer than the settle time | Rare writes may be missed by the joiner; healed by cleanup's `have_many` check and read repair, provided a sufficiently new surviving copy remains available. |
+
+### 10.9 Administrative Cluster Commands
+
+Phase 6 exposes explicit commands for inspecting and managing membership and synchronization.
+
+**`CLUSTER NODES`**
+
+Returns known nodes and their membership information, including node ID, address, state, and incarnation. The local node is identified with `myself`.
+
+**`CLUSTER LEAVE`**
+
+Starts graceful departure for the local node. The node performs its handoff and transitions to `LEFT` after completing the operation.
+
+**`CLUSTER FORGET <id>`**
+
+Explicitly forgets a permanently dead or leaving node.
+
+The command is restricted to eligible membership states and cannot be used to remove the local node.
+
+Forgetting a node changes membership and ring ownership, but does not automatically restore the desired number of data copies.
+
+**`CLUSTER SYNC`**
+
+Starts catch-up synchronization on the local node. It is used to repair incomplete joins and to restore replicas after a node has been permanently removed.
+
+The command returns the number of records processed by the synchronization operation.
+
+### 10.10 Rebalancing and Data Safety
+
+Rebalancing does not make the in-memory cache durable.
+
+The following limitations remain:
+
+- A process restart can lose local records and in-memory stream sessions.
+- A joiner that reaches `ALIVE` after `join_max_wait_ms` may still have missing historical records.
+- A source that becomes unavailable can delay synchronization until another source is available.
+- Cleanup cannot safely remove a record when an owner cannot confirm possession of a sufficiently new version.
+- A forced forget changes the ownership topology but requires a subsequent synchronization operation to restore the desired number of copies.
+- The settle-window assumption cannot guarantee correct behavior under arbitrary network partitions.
+- LWW continues to resolve conflicting records by version ordering rather than preserving concurrent values.
+- The system does not provide disk durability or exactly-once operation execution.
+
+### 10.11 Phase 6 Conclusion
+
+Phase 6 introduces explicit data movement when cluster ownership changes.
+
+A joining or restarted node pulls historical data from existing replicas while continuing to receive writes. A leaving node double-writes to future owners and transfers its existing records before becoming `LEFT`. Cleanup removes obsolete copies only after the current owners confirm that they hold sufficiently new versions.
+
+The protocol is designed to keep client traffic available during membership changes while avoiding premature deletion of data.
+
+The settle-window assumption and bounded join wait make the availability trade-off explicit. A node can become `ALIVE` with incomplete synchronization when the configured wait limit is reached, but the missing data can subsequently be repaired through read repair and `CLUSTER SYNC`.
+
+The implementation remains an in-memory, eventually consistent distributed cache rather than a durable storage system.
 
 ---
 

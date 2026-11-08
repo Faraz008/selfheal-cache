@@ -2,7 +2,7 @@
 
 A lightweight, self-healing distributed in-memory cache built from scratch in Python.
 
-SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, key-value storage, TTL expiration, consistent hashing, replication, gossip protocols, failure detection, hinted handoff, and read repair.
+SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, key-value storage, TTL expiration, consistent hashing, replication, gossip protocols, failure detection, hinted handoff, read repair, and data rebalancing.
 
 The project is developed incrementally, starting with a working single-node cache and expanding toward a distributed, self-healing architecture.
 
@@ -17,6 +17,7 @@ The project is developed incrementally, starting with a working single-node cach
 - Improve availability using sloppy quorum and hinted handoff.
 - Improve read latency using hedged reads.
 - Repair stale or missing replicas using read repair.
+- Support node joining, graceful departure, and historical-data synchronization.
 - Explore anti-entropy mechanisms for data synchronization and recovery.
 
 ## Current Status
@@ -73,10 +74,28 @@ A five-node experiment was conducted by manually terminating node `n3`. The last
 | Hint replay | Implemented |
 | Read repair | Implemented |
 | Hint capacity limits | Implemented |
-| Node-local `INFO` diagnostics | Implemented |
+| Node-local INFO diagnostics | Implemented |
 | Five-node failure/restart chaos test | Passed |
 
-Historical-data catch-up synchronization for restarted nodes is deferred to Phase 6.
+### Phase 5 — [Update with the phase's final status if applicable]
+
+### Phase 6 — Rebalancing and Node Lifecycle
+
+| Feature | Status |
+|---|---|
+| Pull-based synchronization when a node joins | Implemented |
+| Historical-data catch-up for restarted nodes | Implemented |
+| JOINING membership state | Implemented |
+| JOINING-aware write and read paths | Implemented |
+| Graceful node departure using `CLUSTER LEAVE` | Implemented |
+| Double-writing during graceful leave | Implemented |
+| Explicit permanent removal using `CLUSTER FORGET` | Implemented |
+| Manual synchronization using `CLUSTER SYNC` | Implemented |
+| Owner-confirmed data cleanup | Implemented |
+| Rebalancing diagnostics in INFO | Implemented |
+| Join-under-load chaos experiment | Implemented |
+
+Phase 6 introduces data movement when nodes join or leave the cluster. It also adds explicit controls for graceful departure, permanent node removal, and synchronization.
 
 ## Tech Stack
 
@@ -113,7 +132,8 @@ selfheal-cache/
 │   └── ...
 │
 ├── chaos/
-│   └── crude_kill.py
+│   ├── crude_kill.py
+│   └── join_under_load.py
 │
 ├── bench/
 │   └── bench.py
@@ -134,6 +154,8 @@ selfheal-cache/
 ├── pyproject.toml
 └── README.md
 ```
+
+*The tree is representative; additional modules and files may exist.*
 
 ## Getting Started
 
@@ -212,7 +234,7 @@ Each node exposes a client-facing RESP port. The cluster script prints the proce
 
 **Important:** Starting several nodes with only different `--node-id` and `--port` arguments does not necessarily make them members of the same cluster. Use the supplied cluster script or provide the correct peer/seed configuration.
 
-### Inspect Cluster Membership
+## Inspect Cluster Membership
 
 Connect to one of the nodes:
 
@@ -246,6 +268,69 @@ n5 127.0.0.1:7005 alive 1793961276358
 
 The output above illustrates the format. Actual node states and incarnation numbers depend on the running cluster.
 
+## Node Lifecycle and Rebalancing
+
+Phase 6 introduces explicit commands for managing node departure and synchronizing data across the cluster.
+
+### Graceful Node Departure — `CLUSTER LEAVE`
+
+To gracefully remove a node from the cluster, connect to that node and run:
+
+```redis
+CLUSTER LEAVE
+```
+
+The node enters the `LEAVING` state and begins handing its data to the nodes that will own the affected key ranges after it leaves.
+
+During this process:
+
+- The departing node remains part of the transition.
+- Peers double-write to the future owners on a best-effort basis.
+- The departing node pushes its existing records to future owners.
+- The node transitions to `LEFT` after successful handoff.
+
+If the handoff fails or times out, the node reverts to `ALIVE` with a bumped incarnation, allowing the operation to be retried.
+
+A node that crashes during departure can remain in `LEAVING`. It can be restarted to continue recovery or permanently removed using `CLUSTER FORGET`.
+
+### Permanent Node Removal — `CLUSTER FORGET <id>`
+
+Use `CLUSTER FORGET` when a node is permanently unavailable and should be explicitly removed from cluster membership.
+
+Run this command on a surviving node:
+
+```redis
+CLUSTER FORGET n2
+```
+
+Replace `n2` with the ID of the node being removed.
+
+This is a forced membership removal. It does not automatically redistribute the removed node's data or guarantee that the remaining nodes have restored the configured replication factor.
+
+After forgetting a permanently dead node, run `CLUSTER SYNC` on surviving nodes to synchronize data and restore the desired replica placement.
+
+### Synchronization — `CLUSTER SYNC`
+
+Run:
+
+```redis
+CLUSTER SYNC
+```
+
+This triggers synchronization of data with the current cluster ownership and replication layout.
+
+It is useful after:
+
+- A node joins but reaches `ALIVE` with incomplete synchronization.
+- A node is permanently removed using `CLUSTER FORGET`.
+- A previous synchronization attempt could not complete because some sources were unavailable.
+
+Synchronization uses available replicas as sources. If a source becomes unavailable, another candidate can be tried. If synchronization cannot complete within the configured join wait period, the node can become `ALIVE` with gaps rather than remaining unavailable indefinitely.
+
+Read repair and subsequent synchronization can help recover missing records.
+
+**Important:** These operations do not provide disk durability. Records and synchronization sessions are held in memory.
+
 ## Node Diagnostics
 
 The custom `INFO` command provides diagnostic information about the node being queried.
@@ -256,7 +341,9 @@ Connect to a node:
 redis-cli -p 7001 INFO
 ```
 
-The command reports:
+The command reports node-local information.
+
+### Core fields
 
 | Field | Description |
 |---|---|
@@ -268,7 +355,20 @@ The command reports:
 | `hints_written` | Number of hints successfully written by this node |
 | `read_repairs` | Number of read-repair operations recorded by this node |
 
-These are **node-local metrics**, not cluster-wide totals. A counter may remain zero until its corresponding event occurs.
+### Rebalancing and lifecycle fields
+
+| Field | Description |
+|---|---|
+| `state` | Current membership/lifecycle state of the local node |
+| `ring_nodes` | Number of nodes currently participating in the ownership ring |
+| `keys_received` | Number of records received through rebalancing/synchronization |
+| `keys_sent` | Number of records sent during synchronization or handoff |
+| `keys_pushed` | Number of records pushed to future owners during graceful leave |
+| `keys_cleaned` | Number of records cleaned up after ownership transfer was confirmed |
+
+These fields help inspect node lifecycle transitions and observe data movement during joining, leaving, and cleanup.
+
+All `INFO` counters are node-local metrics, not cluster-wide totals. A counter may remain zero until its corresponding event occurs. The exact values depend on the node's activity and lifecycle.
 
 ## Client Usage
 
@@ -288,8 +388,10 @@ cache = redis.Redis(
 cache.ping()
 cache.set("language", "Python")
 print(cache.get("language"))
+
 cache.set("session", "active", ex=60)
 print(cache.ttl("session"))
+
 cache.delete("session")
 cache.close()
 ```
@@ -348,7 +450,7 @@ This command benchmarks SelfHeal Cache on port `7001`; it does not benchmark a R
 
 For distributed testing, start the multi-node cluster and verify membership before running the benchmark. Record the cluster size, node configuration, and benchmark target alongside the results.
 
-See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for detailed measurements, methodology, and limitations.
+See `docs/BENCHMARKS.md` for detailed measurements, methodology, and limitations.
 
 ## Benchmark Results
 
@@ -373,17 +475,13 @@ The consistent hashing implementation was evaluated using 100,000 keys and varyi
 
 The experiment compared modulo hashing against consistent hashing when adding one physical node.
 
-![Key movement](docs/img/key_movement.png)
-
-Consistent hashing moved approximately 33.8% of keys when increasing from two to three nodes, compared with 66.9% for modulo hashing.
+**Consistent hashing moved approximately 33.8% of keys when increasing from two to three nodes**, compared with 66.9% for modulo hashing.
 
 When increasing from ten to eleven nodes, the ring moved approximately 8.8% of keys, compared with 91.1% for modulo hashing.
 
 #### 2. Virtual Node Distribution
 
 The distribution experiment measured load imbalance across 10 physical nodes with different vnode counts.
-
-![Vnode balance](docs/img/vnode_balance.png)
 
 At 150 virtual nodes per physical node, the coefficient of variation was approximately 9.4%. Increasing to 500 vnodes reduced it to 5.5%, with additional ring construction overhead.
 
@@ -393,7 +491,7 @@ The default configuration therefore uses 150 virtual nodes per physical node as 
 
 The following chart shows the distribution of 100,000 keys across five physical nodes using 150 virtual nodes per node.
 
-![Key distribution](docs/img/distribution.png)
+See the distribution charts in `docs/img/`.
 
 #### Phase 2 Performance
 
@@ -413,7 +511,7 @@ The lookup measurement includes key hashing and ring lookup, not network communi
 A five-node cluster was used to evaluate gossip-based failure detection.
 
 | Metric | Result |
-|---|---:|
+|---|---|
 | Cluster size | 5 nodes |
 | Failed node | n3 |
 | Failure method | Manual process termination |
@@ -421,7 +519,7 @@ A five-node cluster was used to evaluate gossip-based failure detection.
 
 The experiment measured the time between terminating `n3` and the last healthy node marking it as `DEAD`.
 
-The observed detection time was approximately **9.80 seconds**.
+The observed detection time was approximately 9.80 seconds.
 
 This was a single manual failure experiment, not a statistically controlled benchmark. Results may vary with network conditions, system load, and cluster configuration.
 
@@ -464,17 +562,19 @@ The experiment terminated `n2`, restarted it, and checked acknowledged writes fo
 
 The test passed its acknowledged-write verification for this particular failure and recovery scenario. It does not establish durability across process restarts: storage and hints are in-memory.
 
-See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for detailed measurements, methodology, and limitations.
+See `docs/BENCHMARKS.md` for detailed measurements, methodology, and limitations.
 
 ## Failure and Recovery Testing
 
-Run the five-node chaos experiment:
+### Five-Node Failure and Restart Experiment
+
+Run:
 
 ```bash
 python chaos/crude_kill.py
 ```
 
-The script starts a five-node cluster using client ports `7101`–`7105`, terminates `n2`, and restarts it.
+The script starts a five-node cluster using client ports `7101–7105`, terminates `n2`, and restarts it.
 
 A recorded run produced:
 
@@ -488,7 +588,27 @@ PASS
 
 The script checks whether acknowledged writes survive the tested node failure and restart scenario.
 
-This is a targeted failure experiment, not a general durability guarantee. The cache's storage and hinted handoff are in-memory, so a process restart can lose locally stored data and hints.
+### Join Under Load Experiment
+
+Run:
+
+```bash
+python chaos/join_under_load.py
+```
+
+This experiment tests node joining and historical-data synchronization while the cluster is handling client traffic.
+
+It exercises the rebalancing path under concurrent load, including:
+
+- Introducing a new node while requests are being processed.
+- Synchronizing historical records to the joining node.
+- Handling ownership changes while writes continue.
+- Observing request failures and retries during the join.
+- Checking data movement and synchronization diagnostics.
+
+The experiment helps evaluate whether the cluster can add capacity without unnecessarily interrupting client traffic.
+
+A successful run demonstrates the tested join-under-load scenario; it does not establish a general guarantee of zero data loss or zero downtime under every network partition or failure combination.
 
 ## Important Design Limitations
 
@@ -496,11 +616,15 @@ This is a targeted failure experiment, not a general durability guarantee. The c
 - LWW conflict resolution uses `(timestamp_ms, node_id)`.
 - TTL is represented as an absolute Unix timestamp in milliseconds.
 - Hints are stored in memory and can be lost if a stand-in fails before replay.
-- A restarted node comes back empty until historical catch-up synchronization is implemented in Phase 6.
+- Storage is in-memory; there is no disk persistence.
+- A restarted node must synchronize historical data before it can fully restore its previous replica coverage.
+- If synchronization reaches `join_max_wait_ms` without completing, a joining node can become `ALIVE` with gaps. Read repair and `CLUSTER SYNC` can help heal those gaps.
 - Read repair can restore data only for keys that are read.
 - A sloppy-quorum write acknowledged through a stand-in may not be visible to a quorum read over the original preference list until hint replay or repair.
 - `SET NX` and `SET XX` are best-effort read-then-write operations, not atomic cluster-wide operations.
-- The project does not currently provide disk persistence, transactions, authentication, or TLS.
+- Rebalancing synchronization sessions are in-memory and are not resumable after process loss.
+- `CLUSTER FORGET` removes a node from membership but does not automatically restore the desired replication factor. Synchronization on surviving nodes is required.
+- The project does not currently provide transactions, authentication, or TLS.
 
 ## Development
 
@@ -536,14 +660,15 @@ The architecture explores distributed-systems concepts such as:
 - Hedged reads
 - Sloppy quorum and hinted handoff
 - Read repair
-- Anti-entropy and historical data recovery
+- Pull-based synchronization and graceful rebalancing
+- Historical data recovery
 
 The long-term goal is to develop a distributed cache that can tolerate node failures, synchronize data between available nodes, and recover automatically without requiring a centralized coordinator.
 
 ## Documentation
 
-- [`docs/DESIGN.md`](docs/DESIGN.md) — Architecture, guarantees, failure handling, and design decisions.
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — Benchmark methodology, measurements, and observations.
+- `docs/DESIGN.md` — Architecture, guarantees, failure handling, rebalancing, and design decisions.
+- `docs/BENCHMARKS.md` — Benchmark methodology, measurements, and observations.
 
 ## License
 

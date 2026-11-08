@@ -1,0 +1,15 @@
+2026-11-08 10:14:08,725 INFO node=n4 member n4 -> joining (inc 1794132848725)
+2026-11-08 10:14:08,725 INFO node=n4 ring rebuilt: ['n4']
+2026-11-08 10:14:08,726 INFO node=n4 client port 7204, RPC port 7804, members=['n4'] N=3 W=2
+2026-11-08 10:14:08,729 INFO node=n4 member n1 -> alive (inc 1794132835080)
+2026-11-08 10:14:08,729 INFO node=n4 member n2 -> alive (inc 1794132835081)
+2026-11-08 10:14:08,729 INFO node=n4 member n3 -> alive (inc 1794132835081)
+2026-11-08 10:14:08,730 INFO node=n4 ring rebuilt: ['n1', 'n2', 'n3', 'n4']
+2026-11-08 10:14:21,726 INFO node=n4 sync complete: 47905 records pulled
+2026-11-08 10:14:21,726 INFO node=n4 member n4 -> alive (inc 1794132848726)
+2026-11-08 10:14:21,726 INFO node=n4 join complete: ALIVE holding 68329 records
+2026-11-08 10:14:27,880 INFO node=n4 member n2 -> leaving (inc 1794132835081)
+2026-11-08 10:14:27,881 INFO node=n4 leaving: ['n2']
+2026-11-08 10:15:24,097 INFO node=n4 member n2 -> left (inc 1794132835081)
+2026-11-08 10:15:24,098 INFO node=n4 ring rebuilt: ['n1', 'n3', 'n4']
+2026-11-08 10:15:24,098 INFO node=n4 leaving: []

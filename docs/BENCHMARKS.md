@@ -59,7 +59,7 @@ Results:
 | SET | 29,931.16 | 1.631 ms |
 | GET | 37,188.55 | 1.319 ms |
 
-Note: redis-benchmark was used as an alternative benchmark client against the project's RESP server on port 7001. These results do not represent the performance of a Redis server.
+Note: `redis-benchmark` was used as an alternative benchmark client against the project's RESP server on port 7001. These results do not represent the performance of a Redis server.
 
 The initial CONFIG warning is expected because the custom RESP server does not implement Redis CONFIG. SET and GET benchmark results were subsequently reported successfully.
 
@@ -495,6 +495,226 @@ Further experiments should include:
 
 ---
 
+## Phase 6 — Rebalancing Under Load
+
+### Environment and Configuration
+
+- Date: 08-11-2026
+- Machine: Windows laptop (WSL2)
+- OS: Ubuntu 24.04
+- Python: 3.12
+- Test script: `chaos/join_under_load.py`
+- Initial cluster: 3 nodes
+- Replication factor: 3
+- Write acknowledgements: 2
+- Initial preload: 20,000 keys
+- Concurrent workload workers: 16
+- New node: n4
+- Gracefully leaving node: n2
+- Join settle delay used for transfer-rate calculation: 3 seconds
+
+The experiment evaluated whether the cluster could add a new node and gracefully remove an existing node while client writes continued.
+
+The script started three nodes, preloaded 20,000 keys, and then launched 16 concurrent workload workers. Node n4 was added while the workload was active. After n4 became `ALIVE`, node n2 was instructed to leave gracefully.
+
+### 1. Node Join Under Load
+
+Node n4 was started while the existing cluster continued handling client traffic.
+
+**Recorded output:**
+
+```text
+[  5.7s] preloaded 20000 keys
+[ 10.7s] STARTED n4 (joining)
+[ 24.3s] n4 ALIVE after 13.6s
+
+node_id:n4
+live_keys:69589
+raw_records:69589
+hints_held:0
+hints_rejected:0
+hints_written:0
+read_repairs:0
+state:alive
+ring_nodes:4
+keys_received:47905
+keys_sent:0
+keys_pushed:0
+keys_cleaned:0
+```
+
+**Results:**
+
+| Metric | Result |
+|---|---:|
+| Initial cluster size | 3 nodes |
+| Cluster size after join | 4 nodes |
+| Joining node | n4 |
+| Time from join start to ALIVE | 13.6 seconds |
+| Settle delay used in calculation | 3.0 seconds |
+| Estimated transfer duration | 10.6 seconds |
+| Keys received | 47,905 |
+| Live keys on n4 at INFO snapshot | 69,589 |
+| Raw records on n4 at INFO snapshot | 69,589 |
+| Hints held | 0 |
+| Hints rejected | 0 |
+| Hints written | 0 |
+| Final membership state | ALIVE |
+
+The `live_keys` and `raw_records` values are node-wide counts at the INFO snapshot. They are not the number of keys transferred during the join. The transfer count used for the calculation is `keys_received`.
+
+### 2. Measured Join Transfer Rate
+
+The join duration includes the settle delay before the transfer work. To estimate the actual transfer rate, the 3-second settle delay is subtracted from the observed join duration.
+
+Calculation:
+
+```text
+Join duration = 13.6 seconds
+Settle delay  = 3.0 seconds
+
+Estimated transfer duration = 13.6 - 3.0
+                            = 10.6 seconds
+
+Keys received = 47,905
+
+Measured transfer rate = Keys received / Transfer duration
+
+                       = 47,905 / 10.6
+
+                       ≈ 4,519 keys/second
+```
+
+**Transfer-rate result:**
+
+| Metric | Result |
+|---|---:|
+| Keys received | 47,905 |
+| Total join duration | 13.6 seconds |
+| Settle delay | 3.0 seconds |
+| Estimated transfer duration | 10.6 seconds |
+| Measured transfer rate | approximately 4,519 keys/sec |
+
+**Comparison with `transfer_rate`:**
+
+The supplied `INFO` output reports `keys_received`, but does not show a `transfer_rate` field. Therefore, a direct comparison against the implementation's reported `transfer_rate` cannot be made from this run's output.
+
+The independently calculated rate of approximately 4,519 keys/sec is the measured rate for this experiment. If the implementation exposes a separate `transfer_rate` statistic, record that value in a future run and compare it against this calculation using the same transfer interval.
+
+The expected 3–5 second join time was not achieved in this run. n4 took 13.6 seconds to become `ALIVE`, including the settle period and data transfer. This indicates that the observed join took longer than the initial expectation; further repeated measurements and profiling are needed to identify the bottleneck.
+
+### 3. Graceful Node Leave Under Load
+
+After n4 joined successfully, the test instructed n2 to leave the cluster gracefully.
+
+**Recorded output:**
+
+```text
+[  29.3s] n2: CLUSTER LEAVE
+reply: OK
+[  81.8s] n2 handed off and left in 52.5s
+```
+
+**Results:**
+
+| Metric | Result |
+|---|---:|
+| Leaving node | n2 |
+| Leave command response | OK |
+| Time to complete graceful leave | 52.5 seconds |
+| Final state | LEFT |
+
+The test waited for n2 to reach `LEFT` before completing the workload and verification.
+
+### 4. Client Workload and Data Integrity
+
+The workload continued while n4 joined and n2 left.
+
+**Recorded final output:**
+
+```text
+=== RESULT ===
+acked_writes=320042 failed_requests=0 retries=0
+lost_acked_writes=0
+latency p50=1.5ms p99=3.8ms max=98ms
+PASS
+```
+
+**Results:**
+
+| Metric | Result |
+|---|---:|
+| Acknowledged writes | 320,042 |
+| Failed requests | 0 |
+| Client retries | 0 |
+| Lost acknowledged writes | 0 |
+| p50 write latency | 1.5 ms |
+| p99 write latency | 3.8 ms |
+| Maximum write latency | 98 ms |
+| Test result | PASS |
+
+The test verified acknowledged keys after the join and leave operations. The script reported no lost acknowledged writes.
+
+The latency values represent client-observed write latency during the workload, not isolated server-side processing time.
+
+### 5. Observations
+
+- The cluster started with three nodes and successfully added n4.
+- n4 transitioned from `JOINING` to `ALIVE` in 13.6 seconds.
+- The new node reported 47,905 received keys.
+- The independently calculated transfer rate was approximately 4,519 keys/sec after excluding the 3-second settle delay.
+- The cluster completed a graceful leave for n2 in 52.5 seconds.
+- The workload recorded 320,042 acknowledged writes.
+- The script reported zero failed requests and zero client retries.
+- The final verification reported zero lost acknowledged writes.
+- The measured p99 write latency was 3.8 ms, with a maximum of 98 ms.
+
+### 6. Interpretation and Limitations
+
+This experiment provides evidence that the tested join and graceful-leave operations completed while client traffic was active.
+
+The zero failed requests and zero lost acknowledged writes are positive results for this particular run. They do not establish a general guarantee that every membership transition or failure sequence will preserve all acknowledged data.
+
+Important limitations:
+
+- Only one recorded join-and-leave run is available.
+- The measured join time was 13.6 seconds, longer than the expected 3–5 seconds.
+- The transfer rate is calculated using the reported `keys_received` and an estimated transfer duration obtained by subtracting the 3-second settle delay.
+- The supplied INFO output does not include a `transfer_rate` value for direct comparison.
+- The experiment does not establish average or worst-case join and leave durations.
+- The test does not simulate simultaneous node failures during rebalancing.
+- The test does not establish durability across process or machine restarts because storage is in-memory.
+- The result is specific to the tested cluster configuration, workload, and WSL2 environment.
+
+### 7. Conclusion
+
+The Phase 6 chaos experiment successfully exercised node addition and graceful removal while the cluster handled concurrent writes.
+
+The new node n4 joined in 13.6 seconds and received 47,905 keys. After excluding the 3-second settle delay, the estimated transfer rate was approximately 4,519 keys/sec.
+
+The existing node n2 completed graceful leave in 52.5 seconds.
+
+Across the workload, the test recorded 320,042 acknowledged writes, zero failed requests, zero retries, and zero lost acknowledged writes. The experiment therefore passed its join, leave, and acknowledged-write verification for this run.
+
+The join duration was higher than the initial 3–5 second expectation. Further repeated tests and profiling should be used to improve and characterize rebalancing performance.
+
+### 8. Next Benchmarking Work
+
+Further experiments should include:
+
+- Repeat join and leave tests to measure average and worst-case durations.
+- Record the implementation's `transfer_rate` statistic alongside `keys_received`.
+- Compare the reported transfer rate with the independently calculated rate.
+- Test joins with different initial key counts and cluster sizes.
+- Measure join duration with different replication factors.
+- Measure the impact of concurrent write traffic on transfer throughput.
+- Test graceful leave when one of the future owners is unavailable.
+- Test forced node failure during an active join or leave.
+- Verify that old owners retain data until the required future owners confirm receipt.
+- Profile the transfer path to identify bottlenecks if join duration remains high.
+
+---
+
 ## Overall Benchmark Summary
 
 | Phase | Component | Main Result |
@@ -508,6 +728,10 @@ Further experiments should include:
 | Phase 4 | Single-node benchmark | 20,623 ops/sec |
 | Phase 4 | Single-node benchmark (100 clients) | 19,960 ops/sec |
 | Phase 4 | Five-node failure/restart test | PASS; 0 lost acknowledged writes in the recorded run |
+| Phase 6 | Node join | n4 ALIVE in 13.6 seconds |
+| Phase 6 | Join transfer | 47,905 keys; ~4,519 keys/sec estimated |
+| Phase 6 | Graceful leave | n2 LEFT in 52.5 seconds |
+| Phase 6 | Join/leave under load | PASS; 320,042 acknowledged writes, 0 failed requests, 0 lost acknowledged writes |
 
 ### Overall Conclusion
 
@@ -517,6 +741,7 @@ The benchmarks establish initial performance and behavior baselines for the self
 - **Phase 2:** Consistent hashing reduced key movement during membership changes, with low lookup overhead and reasonably balanced key distribution.
 - **Phase 3:** The five-node cluster successfully detected a terminated node and propagated the `DEAD` state to all remaining healthy nodes in approximately 9.80 seconds.
 - **Phase 4:** The single-node benchmark showed a throughput regression after the new implementation changes. A separate five-node chaos experiment passed its acknowledged-write verification during one node failure and restart scenario.
+- **Phase 6:** The cluster completed a node join and graceful leave while handling concurrent writes. The recorded run reported zero failed requests and zero lost acknowledged writes, with an estimated join transfer rate of approximately 4,519 keys/sec.
 
 These results provide a foundation for evaluating the performance, scalability and fault tolerance of subsequent cluster implementations.
 
