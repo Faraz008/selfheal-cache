@@ -2,7 +2,7 @@ from collections import Counter
 
 import pytest
 
-from node.ring import Ring
+from node.ring import MAX_HASH, RangeSet, Ring, hash64, ring_diff
 
 
 def keys(n: int) -> list[bytes]:
@@ -137,3 +137,50 @@ def test_walk_yields_every_node_once_and_extends_preference_list():
 
 def test_walk_on_empty_ring():
     assert list(Ring().walk(b"k")) == []
+
+
+def test_diff_of_identical_rings_is_empty():
+    assert ring_diff(make_ring(4), make_ring(4), 3) == []
+
+
+def test_diff_ranges_are_sorted_disjoint_and_in_bounds():
+    moves = ring_diff(make_ring(4), make_ring(5), 3)
+    assert moves
+    prev = 0
+    for mv in moves:
+        assert prev <= mv.lo < mv.hi <= MAX_HASH
+        prev = mv.hi
+
+
+def test_adding_a_node_means_only_the_new_node_gains():
+    for mv in ring_diff(make_ring(4), make_ring(5), 3):
+        assert mv.gained == ("n5",)
+        assert len(mv.lost) == 1
+
+
+def test_removing_a_node_means_only_that_node_loses():
+    full, less = make_ring(5), make_ring(5)
+    less.remove_node("n3")
+    moves = ring_diff(full, less, 3)
+    assert moves
+    assert all(mv.lost == ("n3",) and len(mv.gained) == 1 for mv in moves)
+
+
+def test_diff_agrees_with_per_key_lookup():
+    old, new = make_ring(4), make_ring(5)
+    rs = RangeSet([(m.lo, m.hi) for m in ring_diff(old, new, 3)])
+    for k in keys(5000):
+        changed = set(old.get_preference_list(k, 3)) != set(new.get_preference_list(k, 3))
+        assert (hash64(k) in rs) == changed
+
+
+def test_diff_from_empty_ring_gains_everything():
+    moves = ring_diff(Ring(), make_ring(3), 2)
+    assert moves[0].lo == 0 and moves[-1].hi == MAX_HASH
+    assert all(mv.old == () and len(mv.new) == 2 for mv in moves)
+
+
+def test_fraction_of_keyspace_moved_when_adding_a_node():
+    moves = ring_diff(make_ring(4), make_ring(5), 3)
+    frac = sum(m.hi - m.lo for m in moves) / MAX_HASH
+    assert 0.45 < frac < 0.75  # ideal: the new node joins 3/5 of all replica sets

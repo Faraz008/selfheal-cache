@@ -1,6 +1,9 @@
 import hashlib
 import itertools
 from bisect import bisect_right
+from dataclasses import dataclass, replace
+
+MAX_HASH = 1 << 64
 
 
 def hash64(data: bytes) -> int:
@@ -58,15 +61,12 @@ class Ring:
         owners = self.get_preference_list(key, 1)
         return owners[0] if owners else None
 
-    def walk(self, key: bytes | str):
-        """Yield every distinct physical node once, clockwise from the key.
-        The first N are the preference list; the rest are stand-in candidates."""
+    def _walk_from(self, h: int):
+        """Yield every distinct physical node once, clockwise from hash h."""
         if not self._hashes:
             return
-        if isinstance(key, str):
-            key = key.encode()
         size = len(self._hashes)
-        start = bisect_right(self._hashes, hash64(key))
+        start = bisect_right(self._hashes, h)
         seen: set[str] = set()
         for i in range(size):
             owner = self._owners[(start + i) % size]
@@ -76,7 +76,67 @@ class Ring:
                 if len(seen) == len(self._nodes):
                     return
 
+    def walk(self, key: bytes | str):
+        if isinstance(key, str):
+            key = key.encode()
+        return self._walk_from(hash64(key))
+
+    def prefs_at(self, h: int, n: int) -> tuple[str, ...]:
+        """Preference list for a raw hash value (used by range diffs)."""
+        return tuple(itertools.islice(self._walk_from(h), max(n, 0)))
+
+    def tokens(self) -> list[int]:
+        return list(self._hashes)
+
     def get_preference_list(self, key: bytes | str, n: int) -> list[str]:
         if n < 1:
             return []
         return list(itertools.islice(self.walk(key), n))
+
+
+@dataclass(frozen=True)
+class Move:
+    """Keys with hash in [lo, hi) change replica set from `old` to `new`."""
+
+    lo: int
+    hi: int
+    old: tuple[str, ...]
+    new: tuple[str, ...]
+
+    @property
+    def gained(self) -> tuple[str, ...]:
+        return tuple(n for n in self.new if n not in self.old)
+
+    @property
+    def lost(self) -> tuple[str, ...]:
+        return tuple(n for n in self.old if n not in self.new)
+
+
+def ring_diff(old: Ring, new: Ring, n: int) -> list[Move]:
+    """Every hash range whose SET of n replicas differs between the two rings.
+    Result is sorted, disjoint, and within [0, 2**64)."""
+    edges = sorted({0, MAX_HASH, *old.tokens(), *new.tokens()})
+    moves: list[Move] = []
+    for lo, hi in zip(edges, edges[1:]):
+        o, w = old.prefs_at(lo, n), new.prefs_at(lo, n)
+        if set(o) == set(w):
+            continue
+        last = moves[-1] if moves else None
+        if last is not None and last.hi == lo and last.old == o and last.new == w:
+            moves[-1] = replace(last, hi=hi)  # contiguous and identical: merge
+        else:
+            moves.append(Move(lo, hi, o, w))
+    return moves
+
+
+class RangeSet:
+    """Membership test for sorted, DISJOINT [lo, hi) ranges (ring_diff output qualifies)."""
+
+    def __init__(self, ranges):
+        rs = sorted(ranges)
+        self.los = [lo for lo, _ in rs]
+        self.his = [hi for _, hi in rs]
+
+    def __contains__(self, h: int) -> bool:
+        i = bisect_right(self.los, h) - 1
+        return i >= 0 and h < self.his[i]
