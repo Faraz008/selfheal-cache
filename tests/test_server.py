@@ -72,6 +72,7 @@ async def test_sweeper_collects_without_reads():
             sweep_interval_ms=20,
             tombstone_grace_ms=0,
             hint_ttl_ms=0,
+            max_clock_skew_ms=0,
         )
     )
     await s.start()

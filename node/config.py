@@ -86,6 +86,8 @@ class NodeConfig:
     sync_on_start: bool = True
     # Static-member nodes catch up from peers at boot.
 
+    max_clock_skew_ms: int = 5000  # bound on wall-clock disagreement we plan for
+
     # Cleanup
     cleanup_interval_ms: int = 5000
     cleanup_delay_ms: int = 10_000
@@ -188,6 +190,9 @@ class NodeConfig:
         # Validate data transfer and cleanup configuration.
         if self.transfer_batch < 1 or self.cleanup_batch < 1:
             raise SystemExit("transfer_batch and cleanup_batch must be >= 1")
+
+        if self.tombstone_grace_ms < 2 * self.max_clock_skew_ms:
+            raise SystemExit("tombstone_grace_ms must be at least 2x max_clock_skew_ms")
 
     @classmethod
     def load(cls, argv: list[str] | None = None) -> "NodeConfig":

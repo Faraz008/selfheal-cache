@@ -8,6 +8,17 @@ from node import resp
 from node.config import NodeConfig
 from node.membership import State
 from node.server import Server
+from node.store import Store, now_ms
+
+
+class SkewClock:
+    """Wall clock with an adjustable offset: lets one node run fast or slow."""
+
+    def __init__(self, offset_ms: int = 0):
+        self.offset = offset_ms
+
+    def __call__(self) -> int:
+        return now_ms() + self.offset
 
 
 class ServerError(Exception):
@@ -141,13 +152,13 @@ def sees(server: Server, node_id: str, state: State):
 async def start():
     started: list[Server] = []
 
-    async def _start(cfg: NodeConfig) -> Server:
-        s = Server(cfg)
+    async def _start(cfg: NodeConfig, clock=None) -> Server:
+        store = Store(clock, cfg.tombstone_grace_ms) if clock is not None else None
+        s = Server(cfg, store)
         await s.start()
         started.append(s)
         return s
 
     yield _start
-
     for s in started:
         await s.stop()
