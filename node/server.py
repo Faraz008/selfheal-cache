@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from . import resp
+from .clock import hlc_ms
 from .config import NodeConfig
 from .coordinator import ClusterError, Coordinator
 from .detector import FailureDetector
@@ -62,6 +63,7 @@ class Server:
             cfg,
             self.membership,
             self.peers,
+            self.coord.versions,
         )
 
         self.replayer = HintReplayer(
@@ -88,6 +90,7 @@ class Server:
             self.membership,
             self.peers,
             self.gossip,
+            self.coord.versions,
         )
 
         self.rpc = RpcServer(
@@ -302,6 +305,8 @@ class Server:
             f"hints_rejected:{self.hints.rejected}",
             f"hints_written:{s['hints_written']}",
             f"read_repairs:{s['read_repairs']}",
+            f"clock_drift_rejects:{self.coord.versions.rejected}",
+            f"hlc_lead_ms:{hlc_ms(self.coord.versions.last) - self.store.now()}",
         ]
 
         r = self.rebalancer.stats

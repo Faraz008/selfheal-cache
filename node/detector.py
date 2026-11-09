@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 
+from .clock import HybridClock
 from .config import NodeConfig
 from .gossip import Gossiper
 from .membership import Entry, Membership, State
@@ -11,8 +12,21 @@ log = logging.getLogger("detector")
 
 
 class FailureDetector:
-    def __init__(self, cfg: NodeConfig, membership: Membership, peers: Peers, gossiper: Gossiper):
-        self.cfg, self.m, self.peers, self.gossiper = cfg, membership, peers, gossiper
+    def __init__(
+        self,
+        cfg: NodeConfig,
+        membership: Membership,
+        peers: Peers,
+        gossiper: Gossiper,
+        clock: HybridClock | None = None,
+    ):
+        self.cfg, self.m, self.peers, self.gossiper, self.clock = (
+            cfg,
+            membership,
+            peers,
+            gossiper,
+            clock,
+        )
         self.interval = cfg.probe_interval_ms / 1000
         self.probe_timeout = cfg.probe_timeout_ms / 1000
         self.suspect_timeout = cfg.suspect_timeout_ms / 1000
@@ -63,6 +77,8 @@ class FailureDetector:
             res = await self.peers.call(nid, "ping", timeout=self.probe_timeout)
         except RpcError:
             return False
+        if self.clock is not None:
+            self.clock.observe(res.get("hlc", 0))
         self.m.merge([Entry.from_wire(res["entry"])])  # picks up a refuted incarnation
         return True
 
@@ -111,3 +127,6 @@ class FailureDetector:
                         t.add_done_callback(self._bg.discard)
             except Exception:
                 log.exception("probe round failed")
+
+    async def _rpc_ping(self, a):
+        return {"entry": self.m.self_entry.to_wire(), "hlc": self.clock.last if self.clock else 0}

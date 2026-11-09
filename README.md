@@ -2,7 +2,7 @@
 
 A lightweight, self-healing distributed in-memory cache built from scratch in Python.
 
-SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, key-value storage, TTL expiration, consistent hashing, replication, gossip protocols, failure detection, hinted handoff, read repair, and data rebalancing.
+SelfHeal Cache is a learning-oriented project focused on understanding how distributed caching systems work internally, including client-server communication, key-value storage, TTL expiration, consistent hashing, replication, gossip protocols, failure detection, hinted handoff, read repair, data rebalancing, and clock synchronization.
 
 The project is developed incrementally, starting with a working single-node cache and expanding toward a distributed, self-healing architecture.
 
@@ -14,10 +14,13 @@ The project is developed incrementally, starting with a working single-node cach
 - Distribute keys across nodes using consistent hashing.
 - Implement replication and eventual consistency.
 - Detect node failures through distributed membership protocols.
-- Improve availability using sloppy quorum and hinted handoff.
+- Improve availability using failover, sloppy quorum, and hinted handoff.
 - Improve read latency using hedged reads.
 - Repair stale or missing replicas using read repair.
 - Support node joining, graceful departure, and historical-data synchronization.
+- Handle TTL consistency across replicas using absolute expiration deadlines.
+- Maintain distributed event ordering using Hybrid Logical Clocks.
+- Detect and reject implausibly far-future timestamps.
 - Explore anti-entropy mechanisms for data synchronization and recovery.
 
 ## Current Status
@@ -77,7 +80,17 @@ A five-node experiment was conducted by manually terminating node `n3`. The last
 | Node-local INFO diagnostics | Implemented |
 | Five-node failure/restart chaos test | Passed |
 
-### Phase 5 — [Update with the phase's final status if applicable]
+### Phase 5 — Failover and Survival
+
+| Feature | Status |
+|---|---|
+| Read failover when a preferred replica is unavailable | Implemented |
+| Write failover | Implemented |
+| Sloppy-quorum handling for unavailable replicas | Implemented |
+| Hinted handoff for temporarily unavailable replicas | Implemented |
+| Recovery through hint replay | Implemented |
+
+This phase focuses on keeping requests available when preferred replicas are unavailable, while using available nodes and deferred repair to recover replica coverage.
 
 ### Phase 6 — Rebalancing and Node Lifecycle
 
@@ -96,6 +109,31 @@ A five-node experiment was conducted by manually terminating node `n3`. The last
 | Join-under-load chaos experiment | Implemented |
 
 Phase 6 introduces data movement when nodes join or leave the cluster. It also adds explicit controls for graceful departure, permanent node removal, and synchronization.
+
+### Phase 7 — TTL Consistency and Clock Skew
+
+| Feature | Status |
+|---|---|
+| Hybrid Logical Clock (HLC) | Implemented |
+| Monotonic version generation without artificial millisecond drift | Implemented |
+| Remote HLC timestamp observation | Implemented |
+| Future timestamp drift guard | Implemented |
+| HLC propagation through replication and repair paths | Implemented |
+| HLC exchange through gossip and ping replies | Implemented |
+| Absolute TTL deadline propagation | Implemented |
+| Absolute expiration commands (`EXAT`, `PXAT`, `EXPIREAT`, `PEXPIREAT`) | Implemented |
+| TTL consistency tests across replication and synchronization paths | Implemented |
+| Clock-skew simulation and tests | Completed |
+| Clock diagnostics in INFO | Implemented |
+
+Phase 7 separates **version ordering** from **expiration time**:
+
+- Record versions use Hybrid Logical Clocks.
+- TTL deadlines remain absolute Unix wall-clock timestamps in milliseconds.
+- The coordinating node creates the expiration deadline once, and replicas preserve that same deadline.
+- Nodes reject remote HLC timestamps that exceed the configured clock-drift allowance.
+
+The implementation improves event ordering and TTL consistency across replicas, but it does not eliminate the effects of physical clock skew. See `docs/DESIGN.md` for the guarantees and limitations.
 
 ## Tech Stack
 
@@ -331,6 +369,88 @@ Read repair and subsequent synchronization can help recover missing records.
 
 **Important:** These operations do not provide disk durability. Records and synchronization sessions are held in memory.
 
+## TTL and Clock Handling
+
+SelfHeal Cache uses two separate time representations because expiration and distributed version ordering solve different problems.
+
+### Absolute TTL deadlines
+
+Expiration is stored as an absolute Unix timestamp in milliseconds (`expire_at`).
+
+When a command sets a TTL, the coordinating node calculates the deadline once. That exact deadline is carried through replication, hints, read repair, joining-node synchronization, and handoff.
+
+The server supports relative expiration commands and absolute-deadline commands:
+
+| Command | Meaning |
+|---|---|
+| `EX` | Set expiration in seconds |
+| `PX` | Set expiration in milliseconds |
+| `EXAT` | Set expiration at an absolute Unix timestamp in seconds |
+| `PXAT` | Set expiration at an absolute Unix timestamp in milliseconds |
+| `EXPIREAT` | Set key expiration at an absolute Unix timestamp in seconds |
+| `PEXPIREAT` | Set key expiration at an absolute Unix timestamp in milliseconds |
+| `TTL` | Return remaining lifetime in seconds |
+| `PTTL` | Return remaining lifetime in milliseconds |
+| `PERSIST` | Remove the expiration deadline |
+
+For example:
+
+```redis
+SET session active EX 60
+TTL session
+```
+
+An absolute deadline can also be supplied:
+
+```redis
+SET session active PXAT 1794000000000
+```
+
+An expiration time that is already in the past deletes the key by writing a tombstone.
+
+### Hybrid Logical Clocks
+
+Record versions use a Hybrid Logical Clock (HLC), rather than relying on a wall-clock timestamp that is artificially incremented for every write.
+
+The HLC combines physical time with a logical counter:
+
+```text
+HLC = (physical_time_ms << 16) | logical_counter
+```
+
+The logical counter allows multiple events to receive distinct, monotonically increasing versions within the same physical millisecond.
+
+The record version is:
+
+```text
+(HLC_timestamp, node_id)
+```
+
+The node ID provides a deterministic tie-break when two versions have the same HLC timestamp.
+
+When a node receives a remote version, it observes that timestamp and advances its own HLC when appropriate. Remote HLC values that exceed the configured `max_clock_skew_ms` allowance are rejected.
+
+HLC values are propagated through record-receiving paths and exchanged through gossip and ping replies.
+
+**HLC does not replace NTP or physical clock synchronization.** It improves logical ordering, but it cannot guarantee real-world ordering for concurrent writes that have not observed one another.
+
+### Clock configuration and diagnostics
+
+The `max_clock_skew_ms` configuration controls how far ahead of its local wall clock a node will accept a remote HLC timestamp. The default is 5000 milliseconds.
+
+The tombstone grace period must be at least twice this configured maximum clock skew.
+
+The `INFO` command includes:
+
+| Field | Description |
+|---|---|
+| `clock_drift_rejects` | Number of remote HLC timestamps rejected by the drift guard |
+| `hlc_lead_ms` | Difference between the physical-millisecond component of the latest local HLC and the local wall clock |
+
+`hlc_lead_ms` is a diagnostic value, not a direct measurement of clock skew. A negative value can simply mean the node has not generated a recent version.
+
+See `docs/DESIGN.md` for the detailed clock model, TTL guarantees, and limitations.
+
 ## Node Diagnostics
 
 The custom `INFO` command provides diagnostic information about the node being queried.
@@ -366,7 +486,14 @@ The command reports node-local information.
 | `keys_pushed` | Number of records pushed to future owners during graceful leave |
 | `keys_cleaned` | Number of records cleaned up after ownership transfer was confirmed |
 
-These fields help inspect node lifecycle transitions and observe data movement during joining, leaving, and cleanup.
+### Clock fields
+
+| Field | Description |
+|---|---|
+| `clock_drift_rejects` | Count of remote HLC timestamps rejected by the drift guard |
+| `hlc_lead_ms` | Difference between the latest local HLC physical component and local wall-clock time |
+
+These fields help inspect node activity, data movement, and clock behavior.
 
 All `INFO` counters are node-local metrics, not cluster-wide totals. A counter may remain zero until its corresponding event occurs. The exact values depend on the node's activity and lifecycle.
 
@@ -489,7 +616,7 @@ The default configuration therefore uses 150 virtual nodes per physical node as 
 
 #### 3. Key Distribution
 
-The following chart shows the distribution of 100,000 keys across five physical nodes using 150 virtual nodes per node.
+The distribution experiment evaluated 100,000 keys across five physical nodes using 150 virtual nodes per node.
 
 See the distribution charts in `docs/img/`.
 
@@ -562,7 +689,89 @@ The experiment terminated `n2`, restarted it, and checked acknowledged writes fo
 
 The test passed its acknowledged-write verification for this particular failure and recovery scenario. It does not establish durability across process restarts: storage and hints are in-memory.
 
-See `docs/BENCHMARKS.md` for detailed measurements, methodology, and limitations.
+### Phase 6 — Rebalancing and Node Lifecycle
+
+The join-under-load experiment evaluated node joining and graceful departure while client traffic continued.
+
+| Metric | Result |
+|---|---:|
+| Initial cluster size | 3 nodes |
+| Replication factor | 3 |
+| Write acknowledgements | 2 |
+| Preloaded keys | 20,000 |
+| Concurrent workers | 16 |
+| New node | n4 |
+| New node became ALIVE | 13.6 seconds |
+| Keys received by n4 | 47,905 |
+| Estimated transfer duration | 10.6 seconds |
+| Estimated transfer rate | 4,519 keys/sec |
+| Graceful leave duration for n2 | 52.5 seconds |
+| Acknowledged writes | 320,042 |
+| Failed requests | 0 |
+| Client retries | 0 |
+| Lost acknowledged writes | 0 |
+| Latency p50 | 1.5 ms |
+| Latency p99 | 3.8 ms |
+| Maximum latency | 98 ms |
+
+The 47,905 figure is the receiving node's reported `keys_received` counter. The `INFO` values for `live_keys` and `raw_records` are node-wide snapshots and should not be interpreted as the number of transferred records.
+
+This was a single experiment. It demonstrates the tested join and leave scenario, not a universal guarantee of zero downtime or zero data loss.
+
+### Phase 7 — TTL Consistency and Clock Skew
+
+The Phase 7 benchmark measured the single-node server after introducing HLC versioning, TTL deadline propagation, clock-skew handling, and the associated distributed-system changes.
+
+#### Single-Node Performance
+
+| Benchmark | Operations | Throughput |
+|---|---:|---:|
+| Python benchmark | 200,000 | 18,450 ops/sec |
+| Python benchmark (100 clients) | 400,000 | 16,823 ops/sec |
+
+The benchmark server was started using:
+
+```bash
+python -m node --node-id n1 --port 7001
+```
+
+This was a single-node benchmark, not a distributed-cluster throughput test.
+
+Compared with Phase 1, measured throughput decreased by approximately 38.7% in the default run and 45.3% in the 100-client run.
+
+Compared with Phase 4, measured throughput decreased by approximately 10.5% in the default run and 15.7% in the 100-client run.
+
+These figures show the measured performance of the implementation at this stage. They do not isolate the cost of HLC or any individual Phase 7 feature.
+
+#### System Snapshot
+
+| Metric | Observed value |
+|---|---:|
+| Total memory | 7.5 GiB |
+| Used memory | 3.0 GiB |
+| Free memory | 4.2 GiB |
+| Available memory | 4.4 GiB |
+| Swap used | 0 |
+| Load average | 0.19 / 0.14 / 0.07 |
+
+This is a system snapshot, not a synchronized resource profile collected throughout the benchmark.
+
+#### Clock and TTL Validation
+
+Phase 7 also introduced targeted tests for:
+
+- HLC monotonicity and wall-clock behavior.
+- High write rates without artificial millisecond drift.
+- Remote timestamp observation and future timestamp rejection.
+- HLC propagation through replication, hints, read repair, and synchronization.
+- Gossip-based clock advancement.
+- Identical absolute TTL deadlines across replicas.
+- Expected visibility differences when replica clocks are skewed.
+- Preservation of the original expiration deadline after replica restart.
+
+These are correctness tests, not throughput measurements.
+
+See `docs/BENCHMARKS.md` for the full benchmark history, methodology, and limitations.
 
 ## Failure and Recovery Testing
 
@@ -613,8 +822,12 @@ A successful run demonstrates the tested join-under-load scenario; it does not e
 ## Important Design Limitations
 
 - The system is leaderless; any node can coordinate a client request.
-- LWW conflict resolution uses `(timestamp_ms, node_id)`.
-- TTL is represented as an absolute Unix timestamp in milliseconds.
+- LWW conflict resolution uses `(HLC_timestamp, node_id)`, not a raw wall-clock timestamp.
+- HLC improves logical ordering but does not guarantee real-world ordering for concurrent writes that have not observed one another.
+- TTL uses absolute Unix wall-clock timestamps in milliseconds. Replicas preserve the same deadline, but clock skew can cause temporary differences in when nodes consider a key expired.
+- HLC drift rejection protects a receiving node from adopting an implausibly far-future remote timestamp. A node with a broken clock can still generate problematic versions for its own writes. Physical clock synchronization remains important.
+- Manual wall-clock rewind across a node restart is unsupported because node incarnation uses a wall-clock boot timestamp.
+- `EXPIRE` and `PERSIST` are read-modify-write operations and can overwrite a concurrent `SET`. They are not atomic cluster-wide operations.
 - Hints are stored in memory and can be lost if a stand-in fails before replay.
 - Storage is in-memory; there is no disk persistence.
 - A restarted node must synchronize historical data before it can fully restore its previous replica coverage.
@@ -624,7 +837,7 @@ A successful run demonstrates the tested join-under-load scenario; it does not e
 - `SET NX` and `SET XX` are best-effort read-then-write operations, not atomic cluster-wide operations.
 - Rebalancing synchronization sessions are in-memory and are not resumable after process loss.
 - `CLUSTER FORGET` removes a node from membership but does not automatically restore the desired replication factor. Synchronization on surviving nodes is required.
-- The project does not currently provide transactions, authentication, or TLS.
+- The project does not currently provide transactions, authentication, TLS, or disk durability.
 
 ## Development
 
@@ -648,7 +861,7 @@ ruff format .
 
 ## Design Philosophy
 
-The project is being built incrementally, prioritizing understanding and correctness before optimization.
+The project is built incrementally, prioritizing understanding and correctness before optimization.
 
 The architecture explores distributed-systems concepts such as:
 
@@ -662,12 +875,14 @@ The architecture explores distributed-systems concepts such as:
 - Read repair
 - Pull-based synchronization and graceful rebalancing
 - Historical data recovery
+- Hybrid Logical Clocks
+- TTL consistency and clock-skew handling
 
 The long-term goal is to develop a distributed cache that can tolerate node failures, synchronize data between available nodes, and recover automatically without requiring a centralized coordinator.
 
 ## Documentation
 
-- `docs/DESIGN.md` — Architecture, guarantees, failure handling, rebalancing, and design decisions.
+- `docs/DESIGN.md` — Architecture, guarantees, failure handling, rebalancing, clock model, and design decisions.
 - `docs/BENCHMARKS.md` — Benchmark methodology, measurements, and observations.
 
 ## License

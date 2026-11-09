@@ -1,5 +1,23 @@
 # SelfHeal Cache — Benchmark Results
 
+## Benchmark Methodology and Environment
+
+Unless otherwise stated, benchmarks were performed on a Windows laptop using WSL2.
+
+**Common environment:**
+
+- OS: Ubuntu 24.04 (WSL2)
+- Python: 3.12
+- Benchmark client: Project's Python benchmark (`bench/bench.py`)
+- Client protocol: RESP
+- Client port: 7001
+
+These measurements are experimental results from the development environment. They are not statistically controlled production benchmarks.
+
+Different phases measure different parts of the system. A single-node throughput benchmark, a ring lookup benchmark, a failure-detection experiment, and a multi-node chaos test should not be interpreted as directly comparable measurements.
+
+---
+
 ## Phase 1 — Initial RESP Server
 
 ### Environment
@@ -142,7 +160,7 @@ The experiment measured load balance across 10 physical nodes using different vn
 
 The coefficient of variation (CV) was used to measure load imbalance:
 
-CV = Standard Deviation / Mean
+`CV = Standard Deviation / Mean`
 
 A lower CV indicates a more balanced distribution.
 
@@ -450,8 +468,6 @@ PASS
 - The script reported zero lost acknowledged writes after the node was restarted.
 - The recorded p99 latency was 3.6 ms, with a maximum latency of 35 ms.
 
-The experiment demonstrates that the tested failure and restart scenario completed successfully according to the chaos script's acknowledged-write verification.
-
 ### 5. Interpretation and Limitations
 
 This result is evidence for one particular failure and restart scenario. It is not proof of general durability or recovery under every failure condition.
@@ -597,7 +613,7 @@ Measured transfer rate = Keys received / Transfer duration
 
 **Comparison with `transfer_rate`:**
 
-The supplied `INFO` output reports `keys_received`, but does not show a `transfer_rate` field. Therefore, a direct comparison against the implementation's reported `transfer_rate` cannot be made from this run's output.
+The supplied INFO output reports `keys_received`, but does not show a `transfer_rate` field. Therefore, a direct comparison against the implementation's reported `transfer_rate` cannot be made from this run's output.
 
 The independently calculated rate of approximately 4,519 keys/sec is the measured rate for this experiment. If the implementation exposes a separate `transfer_rate` statistic, record that value in a future run and compare it against this calculation using the same transfer interval.
 
@@ -715,6 +731,165 @@ Further experiments should include:
 
 ---
 
+## Phase 7 — TTL Consistency and Clock Skew
+
+### Environment and Configuration
+
+- Date: 09-11-2026
+- Machine: Windows laptop (WSL2)
+- OS: Ubuntu 24.04
+- Python: 3.12
+- Server: Single node (`n1`)
+- Client port: 7001
+- Benchmark client: Project's Python benchmark (`bench/bench.py`)
+- Versioning: Hybrid Logical Clock (HLC)
+- TTL representation: Absolute Unix timestamp in milliseconds
+
+The Phase 7 benchmark was run after implementing HLC-based versioning, clock-skew protection, TTL consistency changes, and the associated replication and synchronization paths.
+
+### 1. Python Benchmark — Default Configuration
+
+Command:
+
+```bash
+python bench/bench.py
+```
+
+Results:
+
+| Metric | Result |
+|---|---:|
+| Total operations | 200,000 |
+| Execution time | 10.84 seconds |
+| Operations/sec | 18,450 |
+
+### 2. Python Benchmark — 100 Clients
+
+Command:
+
+```bash
+python bench/bench.py --clients 100
+```
+
+Results:
+
+| Metric | Result |
+|---|---:|
+| Total operations | 400,000 |
+| Execution time | 23.78 seconds |
+| Operations/sec | 16,823 |
+| Concurrent clients | 100 |
+
+### 3. Comparison Against Previous Phases
+
+| Benchmark | Phase 1 | Phase 4 | Phase 7 |
+|---|---:|---:|---:|
+| Python benchmark (default) | 30,111 | 20,623 | 18,450 |
+| Python benchmark (100 clients) | 30,729 | 19,960 | 16,823 |
+
+All throughput values are in operations per second.
+
+**Change compared with Phase 1:**
+
+| Benchmark | Phase 1 | Phase 7 | Throughput change |
+|---|---:|---:|---:|
+| Default | 30,111 | 18,450 | -38.7% |
+| 100 clients | 30,729 | 16,823 | -45.3% |
+
+**Change compared with Phase 4:**
+
+| Benchmark | Phase 4 | Phase 7 | Throughput change |
+|---|---:|---:|---:|
+| Default | 20,623 | 18,450 | -10.5% |
+| 100 clients | 19,960 | 16,823 | -15.7% |
+
+### 4. Observations
+
+- The default benchmark achieved 18,450 operations per second.
+- The 100-client benchmark achieved 16,823 operations per second.
+- Throughput is lower than the original Phase 1 baseline.
+- Throughput is also lower than the Phase 4 single-node measurements.
+- The 100-client run achieved lower throughput than the default run.
+- The default benchmark decreased by approximately 10.5% compared with Phase 4.
+- The 100-client benchmark decreased by approximately 15.7% compared with Phase 4.
+
+These measurements show a further single-node throughput decrease after the Phase 4 benchmark. They do not establish which individual Phase 7 feature caused the decrease.
+
+### 5. System Resource Snapshot
+
+A system resource check was performed during the Phase 7 investigation.
+
+| Metric | Observed value |
+|---|---:|
+| System memory | 7.5 GiB |
+| Memory used | 3.0 GiB |
+| Memory free | 4.2 GiB |
+| Memory available | 4.4 GiB |
+| Swap used | 0 |
+| Load average | 0.19, 0.14, 0.07 |
+
+The resource snapshot did not indicate heavy overall system load at the time it was collected.
+
+However, this was not a continuous resource measurement synchronized with every benchmark run. It cannot establish that CPU scheduling, background processes, or other system activity had no effect on throughput.
+
+### 6. Interpretation and Limitations
+
+The Phase 7 measurements are single-node benchmark results. The node was started using:
+
+```bash
+python -m node --node-id n1 --port 7001
+```
+
+This invocation used the default startup configuration rather than explicitly starting the three-node configuration from `config.example.json`.
+
+Therefore, the benchmark should not be interpreted as a three-node replication benchmark.
+
+It measures the observed performance of the single-node server after the Phase 7 code changes. It does not isolate the cost of:
+
+- HLC version generation and observation.
+- Clock-skew validation.
+- TTL deadline handling.
+- HLC propagation through replication and gossip.
+- Multi-node replication traffic.
+- Hint replay and read repair.
+- Join synchronization or graceful handoff.
+
+The benchmark script and startup configuration should be checked together before drawing a precise conclusion about the source of the throughput regression.
+
+The comparison against earlier phases is useful as a development performance trend, but it is not a controlled feature-by-feature benchmark. Different startup configurations, workloads, code paths, or system conditions can affect the results.
+
+### 7. Conclusion
+
+The Phase 7 single-node benchmark recorded:
+
+- 18,450 operations per second for the default benchmark.
+- 16,823 operations per second with 100 concurrent clients.
+
+Compared with Phase 4, throughput decreased by approximately 10.5% for the default benchmark and 15.7% for the 100-client benchmark.
+
+Compared with Phase 1, throughput decreased by approximately 38.7% and 45.3%, respectively.
+
+These results establish the current Phase 7 performance baseline after implementing HLC-based versioning and TTL consistency changes.
+
+The measurements show a throughput regression, but further profiling and controlled comparisons are required to identify its cause. They should not be treated as proof that HLC or TTL handling alone caused the decrease.
+
+### 8. Next Benchmarking Work
+
+Further experiments should include:
+
+- Inspecting the benchmark script to confirm the exact workload and operation mix.
+- Verifying that Phase 1, Phase 4, and Phase 7 use equivalent startup configurations.
+- Measuring CPU usage during each benchmark run.
+- Running multiple benchmark trials and recording mean and standard deviation.
+- Profiling HLC version generation and timestamp observation.
+- Measuring the overhead of TTL handling independently.
+- Comparing a single-node run with a verified three-node cluster.
+- Measuring the effect of HLC propagation through replication and gossip.
+- Recording latency percentiles beyond throughput.
+- Repeating the benchmarks after performance optimizations.
+
+---
+
 ## Overall Benchmark Summary
 
 | Phase | Component | Main Result |
@@ -732,17 +907,22 @@ Further experiments should include:
 | Phase 6 | Join transfer | 47,905 keys; ~4,519 keys/sec estimated |
 | Phase 6 | Graceful leave | n2 LEFT in 52.5 seconds |
 | Phase 6 | Join/leave under load | PASS; 320,042 acknowledged writes, 0 failed requests, 0 lost acknowledged writes |
+| Phase 7 | Single-node benchmark | 18,450 ops/sec |
+| Phase 7 | Single-node benchmark (100 clients) | 16,823 ops/sec |
 
-### Overall Conclusion
+## Overall Conclusion
 
-The benchmarks establish initial performance and behavior baselines for the self-healing distributed cache.
+The benchmarks establish initial performance and behavior baselines for SelfHeal Cache.
 
 - **Phase 1:** The single-node RESP server achieved approximately 30k operations per second.
 - **Phase 2:** Consistent hashing reduced key movement during membership changes, with low lookup overhead and reasonably balanced key distribution.
-- **Phase 3:** The five-node cluster successfully detected a terminated node and propagated the `DEAD` state to all remaining healthy nodes in approximately 9.80 seconds.
-- **Phase 4:** The single-node benchmark showed a throughput regression after the new implementation changes. A separate five-node chaos experiment passed its acknowledged-write verification during one node failure and restart scenario.
+- **Phase 3:** The five-node cluster detected a terminated node and propagated the `DEAD` state to all remaining healthy nodes in approximately 9.80 seconds.
+- **Phase 4:** The single-node benchmark showed a throughput regression compared with Phase 1. A separate five-node chaos experiment passed its acknowledged-write verification during one node failure and restart scenario.
 - **Phase 6:** The cluster completed a node join and graceful leave while handling concurrent writes. The recorded run reported zero failed requests and zero lost acknowledged writes, with an estimated join transfer rate of approximately 4,519 keys/sec.
+- **Phase 7:** The single-node benchmark recorded 18,450 ops/sec by default and 16,823 ops/sec with 100 clients after implementing HLC-based versioning and TTL consistency changes.
 
-These results provide a foundation for evaluating the performance, scalability and fault tolerance of subsequent cluster implementations.
+The results demonstrate progress in the cache's distributed functionality, but they also show that single-node throughput has decreased from the initial baseline.
 
-All measurements should be treated as initial experimental baselines rather than statistically validated performance guarantees.
+The next performance priority should be to identify the cause of the throughput regression using equivalent benchmark configurations, repeated trials, and profiling.
+
+All measurements should be treated as experimental results from the tested WSL2 environment, not statistically validated performance guarantees.

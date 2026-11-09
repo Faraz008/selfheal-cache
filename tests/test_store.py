@@ -1,6 +1,6 @@
 import pytest
 
-from node.store import Record, Store, VersionClock
+from node.store import Record, Store
 
 
 class FakeClock:
@@ -112,18 +112,6 @@ def test_already_collectable_record_clears_older_value(store, clock):
     assert store.apply(b"a", Record(None, (20, "n1"), t - 5000)) is False
     assert store.get_live(b"a") is None
     assert store.raw_len() == 0
-
-
-def test_version_clock_strictly_increasing_in_same_ms():
-    vc = VersionClock("n1", lambda: 5)
-    assert [vc.next() for _ in range(3)] == [(5, "n1"), (6, "n1"), (7, "n1")]
-
-
-def test_version_clock_follows_wall_clock(clock):
-    vc = VersionClock("n1", clock)
-    a = vc.next()
-    clock.advance(100)
-    assert vc.next()[0] - a[0] == 100
 
 
 def test_transferable_ships_expired_value_as_bare_tombstone(store, clock):

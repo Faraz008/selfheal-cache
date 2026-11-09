@@ -3,12 +3,13 @@ import logging
 import time
 from collections import Counter
 
+from .clock import HybridClock
 from .config import NodeConfig
 from .hints import HintStore
 from .membership import Entry, Membership, State
 from .ring import Ring
 from .rpc import Peers, RpcError
-from .store import Record, Store, VersionClock
+from .store import Record, Store
 from .wire import b64d, b64e, rec_from_wire, rec_to_wire
 
 log = logging.getLogger("coord")
@@ -36,7 +37,7 @@ class Coordinator:
         )
         self.id = cfg.node_id
         self.ring = Ring(cfg.vnodes)
-        self.versions = VersionClock(self.id, store.now)
+        self.versions = HybridClock(self.id, store.now, cfg.max_clock_skew_ms)
         self._bg: set[asyncio.Task] = set()
         self.stats = Counter()
 
@@ -108,30 +109,18 @@ class Coordinator:
         }
 
     async def _rpc_put(self, a):
-        return self.store.apply(
-            b64d(a["k"]),
-            rec_from_wire(a["r"]),
-        )
+        return self.store.apply(b64d(a["k"]), self.observe(rec_from_wire(a["r"])))
 
     async def _rpc_get(self, a):
         rec = self.store.get_record(b64d(a["k"]))
         return None if rec is None else rec_to_wire(rec)
 
     async def _rpc_hint(self, a):
-        """Hold a write for `owner`, who is down."""
-        return self.hints.add(
-            a["o"],
-            b64d(a["k"]),
-            rec_from_wire(a["r"]),
-        )
+        return self.hints.add(a["o"], b64d(a["k"]), self.observe(rec_from_wire(a["r"])))
 
     async def _rpc_put_many(self, a):
         return sum(
-            self.store.apply(
-                b64d(i["k"]),
-                rec_from_wire(i["r"]),
-            )
-            for i in a["items"]
+            self.store.apply(b64d(i["k"]), self.observe(rec_from_wire(i["r"]))) for i in a["items"]
         )
 
     # ---- client-facing operations (this node acting as COORDINATOR) ----
@@ -148,11 +137,10 @@ class Coordinator:
         )
 
     async def delete(self, key: bytes) -> None:
-        v = self.versions.next()
         await self._replicate(
             key,
-            Record(None, v, v[0]),
-        )  # tombstone
+            Record(None, self.versions.next(), self.now()),
+        )
 
     def read_plan(self, key: bytes) -> tuple[list[str], int]:
         """(candidates best-first, number of JOINING replicas). While a replica is joining
@@ -178,7 +166,7 @@ class Coordinator:
             "get",
             {"k": b64e(key)},
         )
-        return None if d is None else rec_from_wire(d)
+        return None if d is None else self.observe(rec_from_wire(d))
 
     async def _gather_answers(
         self,
@@ -412,3 +400,7 @@ class Coordinator:
 
         if acks < need:
             raise ClusterError(f"write acked by {acks}/{need} replicas")
+
+    def observe(self, rec: Record) -> Record:
+        self.versions.observe(rec.version[0])
+        return rec

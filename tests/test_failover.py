@@ -158,7 +158,7 @@ async def test_read_repair_spreads_a_tombstone(start):
     c = await connect(servers[0].port)
     await c.cmd("SET", "k", "v")
     v = servers[0].coord.versions.next()
-    tomb = Record(None, v, v[0])
+    tomb = Record(None, v, servers[0].coord.now())
     servers[0].store.apply(b"k", tomb)
     servers[1].store.apply(b"k", tomb)  # n3 still holds the live value
     assert await c.cmd("GET", "k") is None

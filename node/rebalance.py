@@ -146,7 +146,7 @@ class Rebalancer:
                     src, "stream_next", {"sid": sid, "n": self.cfg.transfer_batch}, timeout=10
                 )
                 for it in res["items"]:
-                    self.store.apply(b64d(it["k"]), rec_from_wire(it["r"]))
+                    self.store.apply(b64d(it["k"]), self.coord.observe(rec_from_wire(it["r"])))
                 got += len(res["items"])
                 if res["done"]:
                     return got

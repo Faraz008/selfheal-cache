@@ -24,20 +24,6 @@ class Record:
         return self.value is not None and (self.expire_at is None or self.expire_at > now)
 
 
-class VersionClock:
-    """Strictly increasing versions for writes coordinated by this node,
-    even for several writes in the same millisecond."""
-
-    def __init__(self, node_id: str, clock: Callable[[], int] = now_ms):
-        self.node_id = node_id
-        self._clock = clock
-        self._last = 0
-
-    def next(self) -> Version:
-        self._last = max(self._clock(), self._last + 1)
-        return (self._last, self.node_id)
-
-
 class Store:
     def __init__(self, clock: Callable[[], int] = now_ms, grace_ms: int = 600_000):
         self.now = clock  # injectable so tests control time

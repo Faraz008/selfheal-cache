@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 
+from .clock import HybridClock
 from .config import NodeConfig
 from .membership import Entry, Membership, State
 from .rpc import Peers, RpcClient, RpcError
@@ -12,10 +13,17 @@ log = logging.getLogger("gossip")
 class Gossiper:
     """Push-pull anti-entropy: exchange and merge membership tables."""
 
-    def __init__(self, cfg: NodeConfig, membership: Membership, peers: Peers):
+    def __init__(
+        self,
+        cfg: NodeConfig,
+        membership: Membership,
+        peers: Peers,
+        clock: HybridClock | None = None,
+    ):
         self.cfg = cfg
         self.m = membership
         self.peers = peers
+        self.clock = clock
 
         self.rng = random.Random()
 
@@ -28,10 +36,11 @@ class Gossiper:
 
     async def _rpc_gossip(self, a):
         """Receive another node's membership table and return our updated table."""
+        self._absorb(a)
         self.m.merge([Entry.from_wire(d) for d in a["members"]])
 
         # Reply after merging so the caller learns about our membership too.
-        return {"members": self.m.snapshot()}
+        return self._stamp({"members": self.m.snapshot()})
 
     async def start(self) -> None:
         """Start periodic gossip and, if configured, seed bootstrap."""
@@ -73,7 +82,7 @@ class Gossiper:
                 try:
                     res = await client.call(
                         "gossip",
-                        {"members": self.m.snapshot()},
+                        self._stamp({"members": self.m.snapshot()}),
                     )
                 except RpcError as e:
                     log.warning(
@@ -86,7 +95,8 @@ class Gossiper:
                 finally:
                     await client.close()
 
-                # Merge the membership information returned by the seed.
+                # Absorb the seed's HLC before merging its membership.
+                self._absorb(res)
                 self.m.merge([Entry.from_wire(d) for d in res["members"]])
 
                 if self.m.self_entry.state is State.JOINING:
@@ -142,12 +152,25 @@ class Gossiper:
             res = await self.peers.call(
                 node_id,
                 "gossip",
-                {"members": self.m.snapshot()},
+                self._stamp({"members": self.m.snapshot()}),
             )
         except RpcError as e:
             log.debug("gossip to %s failed: %s", node_id, e)
             return False
 
+        self._absorb(res)
         self.m.merge([Entry.from_wire(d) for d in res["members"]])
 
         return True
+
+    def _stamp(self, msg: dict) -> dict:
+        if self.clock is not None:
+            msg["hlc"] = self.clock.last
+        return msg
+
+    def _absorb(self, msg: dict) -> None:
+        if self.clock is not None and "hlc" in msg and not self.clock.observe(msg["hlc"]):
+            log.warning(
+                "a peer's clock is >%d ms ahead of ours; ignoring its timestamps",
+                self.cfg.max_clock_skew_ms,
+            )
