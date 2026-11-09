@@ -119,6 +119,8 @@ class Server:
             "EXISTS": (self.cmd_exists, 1, None),
             "EXPIRE": (self.cmd_expire, 2, 2),
             "PEXPIRE": (self.cmd_pexpire, 2, 2),
+            "EXPIREAT": (self.cmd_expireat, 2, 2),
+            "PEXPIREAT": (self.cmd_pexpireat, 2, 2),
             "TTL": (self.cmd_ttl, 1, 1),
             "PTTL": (self.cmd_pttl, 1, 1),
             "PERSIST": (self.cmd_persist, 1, 1),
@@ -378,30 +380,19 @@ class Server:
         while i < len(a):
             opt = a[i].upper()
 
-            if opt in (b"EX", b"PX"):
+            if opt in (b"EX", b"PX", b"EXAT", b"PXAT"):
                 if i + 1 >= len(a):
                     raise CommandError("ERR syntax error")
-
                 n = parse_int(a[i + 1])
-
                 if n <= 0:
                     raise CommandError("ERR invalid expire time in 'set' command")
-
-                # Compute the absolute expiration timestamp once.
-                expire_at = self.coord.now() + (n * 1000 if opt == b"EX" else n)
-
+                if opt == b"EX":
+                    expire_at = self.coord.now() + n * 1000  # relative -> absolute, ONCE, here
+                elif opt == b"PX":
+                    expire_at = self.coord.now() + n
+                else:
+                    expire_at = n * 1000 if opt == b"EXAT" else n  # client gave the deadline
                 i += 2
-
-            elif opt == b"NX":
-                nx = True
-                i += 1
-
-            elif opt == b"XX":
-                xx = True
-                i += 1
-
-            else:
-                raise CommandError("ERR syntax error")
 
         if nx and xx:
             raise CommandError("ERR syntax error")
@@ -437,27 +428,33 @@ class Server:
 
         return resp.integer(n)
 
-    async def _expire(self, a, mult):
-        n = parse_int(a[1])
-
-        rec = await self.coord.read(a[0])
-
+    async def _set_expiry(self, key: bytes, ts: int) -> bytes:
+        rec = await self.coord.read(key)
         if rec is None:
             return resp.integer(0)
-
-        await self.coord.set(
-            a[0],
-            rec.value,
-            self.coord.now() + n * mult,
-        )
-
+        if ts <= self.coord.now():
+            await self.coord.delete(key)  # Redis semantics: a deadline in the past deletes
+        else:
+            await self.coord.set(key, rec.value, ts)
         return resp.integer(1)
+
+    async def _expire(self, a, mult):
+        return await self._set_expiry(a[0], self.coord.now() + parse_int(a[1]) * mult)
+
+    async def _expire_at(self, a, mult):
+        return await self._set_expiry(a[0], parse_int(a[1]) * mult)
 
     async def cmd_expire(self, a):
         return await self._expire(a, 1000)
 
     async def cmd_pexpire(self, a):
         return await self._expire(a, 1)
+
+    async def cmd_expireat(self, a):
+        return await self._expire_at(a, 1000)
+
+    async def cmd_pexpireat(self, a):
+        return await self._expire_at(a, 1)
 
     async def _ttl_ms(self, key: bytes) -> int:
         rec = await self.coord.read(key)
