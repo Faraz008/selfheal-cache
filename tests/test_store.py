@@ -154,3 +154,23 @@ def test_keys_snapshot_is_a_copy(store):
     snap = store.keys_snapshot()
     store.apply(b"b", rec(b"1", 10))
     assert snap == [b"a"]
+
+
+def test_persist_beats_older_ttl_in_any_arrival_order(clock):
+    t = clock()
+    with_ttl, persisted = rec(b"1", 10, exp=t + 5000), rec(b"1", 20)
+    for order in ([with_ttl, persisted], [persisted, with_ttl]):
+        s = Store(clock=clock, grace_ms=1000)
+        for r in order:
+            s.apply(b"a", r)
+        assert s.get_record(b"a").expire_at is None
+        assert s.get_live(b"a").value == b"1"
+
+
+def test_ttl_is_decided_by_version_not_by_which_deadline_is_later(store, clock):
+    t = clock()
+    store.apply(b"a", rec(b"1", 10, exp=t + 9000))
+    store.apply(b"a", rec(b"1", 20, exp=t + 1000))  # newer version, SHORTER deadline: wins
+    assert store.get_record(b"a").expire_at == t + 1000
+    store.apply(b"a", rec(b"1", 15, exp=t + 50_000))  # older version: ignored
+    assert store.get_record(b"a").expire_at == t + 1000
