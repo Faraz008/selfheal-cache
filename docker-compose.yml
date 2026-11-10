@@ -1,0 +1,46 @@
+name: selfheal
+
+x-node: &node
+  build: .
+  image: selfheal-cache:dev
+  cap_add: [NET_ADMIN]          # for iptables partitions
+  networks: [cache]
+  stop_grace_period: 3s
+  volumes:
+    - ./docker/node.json:/etc/cache/node.json:ro
+  healthcheck:                  # healthy == the node reports state:alive
+    test: ["CMD", "python", "-c", "import socket,sys; s=socket.create_connection(('127.0.0.1',7001),1); s.sendall(b'INFO\\r\\n'); sys.exit(0 if b'state:alive' in s.recv(4096) else 1)"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+    start_period: 3s
+
+services:
+  n1:
+    <<: *node
+    command: ["--config", "/etc/cache/node.json", "--node-id", "n1", "--advertise-host", "n1", "--seeds", "n2:8001,n3:8001"]
+    ports: ["7001:7001"]
+  n2:
+    <<: *node
+    command: ["--config", "/etc/cache/node.json", "--node-id", "n2", "--advertise-host", "n2", "--seeds", "n1:8001,n3:8001"]
+    ports: ["7002:7001"]
+  n3:
+    <<: *node
+    command: ["--config", "/etc/cache/node.json", "--node-id", "n3", "--advertise-host", "n3", "--seeds", "n1:8001,n2:8001"]
+    ports: ["7003:7001"]
+  n4:
+    <<: *node
+    command: ["--config", "/etc/cache/node.json", "--node-id", "n4", "--advertise-host", "n4", "--seeds", "n1:8001,n2:8001"]
+    ports: ["7004:7001"]
+  n5:
+    <<: *node
+    command: ["--config", "/etc/cache/node.json", "--node-id", "n5", "--advertise-host", "n5", "--seeds", "n1:8001,n2:8001"]
+    ports: ["7005:7001"]
+  n6:                           # not started by `up`: the node the chaos harness adds live
+    <<: *node
+    profiles: ["extra"]
+    command: ["--config", "/etc/cache/node.json", "--node-id", "n6", "--advertise-host", "n6", "--seeds", "n1:8001,n2:8001"]
+    ports: ["7006:7001"]
+
+networks:
+  cache: {}
