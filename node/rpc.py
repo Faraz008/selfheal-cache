@@ -3,6 +3,7 @@ import itertools
 import json
 import logging
 import struct
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -110,6 +111,8 @@ class RpcClient:
         self._ids = itertools.count(1)
         self._conn_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        self._last_rx = time.monotonic()
+        self.connects = 0
 
     def _connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing()
@@ -122,12 +125,15 @@ class RpcClient:
                 return
             reader, writer = await asyncio.open_connection(self.host, self.port)
             self._writer = writer
+            self._last_rx = time.monotonic()
+            self.connects += 1
             self._read_task = asyncio.create_task(self._read_loop(reader, writer))
 
     async def _read_loop(self, reader, writer) -> None:
         err = "connection closed"
         try:
             while (msg := await read_frame(reader)) is not None:
+                self._last_rx = time.monotonic()
                 fut = self._pending.get(msg.get("id"))
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
@@ -141,30 +147,65 @@ class RpcClient:
                 if not fut.done():
                     fut.set_exception(RpcError(err))
 
-    async def call(self, op: str, args: dict | None = None, timeout: float | None = None) -> Any:
+    def _reset_if_wedged(self) -> None:
+        """Nothing received for 3x the timeout while calls keep timing out: the socket is
+        wedged (partition, frozen peer). Abort it so the next call dials fresh."""
+        w = self._writer
+
+        if w is not None and time.monotonic() - self._last_rx > 3 * self.timeout:
+            w.transport.abort()
+
+    async def call(
+        self,
+        op: str,
+        args: dict | None = None,
+        timeout: float | None = None,
+    ) -> Any:
         rid = next(self._ids)
         fut = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
+
         where = f"{self.host}:{self.port}"
+
         log.debug("rpc -> %s id=%d op=%s", where, rid, op)
+
         try:
             async with asyncio.timeout(timeout or self.timeout):
                 await self._connect()
+
                 async with self._write_lock:
                     w = self._writer
+
                     if w is None or w.is_closing():
                         raise ConnectionError("not connected")
-                    w.write(encode_frame({"id": rid, "op": op, "args": args or {}}))
+
+                    w.write(
+                        encode_frame(
+                            {
+                                "id": rid,
+                                "op": op,
+                                "args": args or {},
+                            }
+                        )
+                    )
+
                     await w.drain()
+
                 msg = await fut
+
         except TimeoutError:
+            self._reset_if_wedged()
             raise RpcError(f"{op} to {where} timed out") from None
+
         except OSError as e:
             raise RpcError(f"{op} to {where} failed: {e!r}") from None
+
         finally:
             self._pending.pop(rid, None)
+
         if not msg["ok"]:
             raise RpcError(msg["err"])
+
         return msg["res"]
 
     async def close(self) -> None:

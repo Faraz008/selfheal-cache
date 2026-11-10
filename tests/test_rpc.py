@@ -93,3 +93,12 @@ async def test_reconnects_after_server_restart():
     assert await cli.call("echo", {"a": 2}) == {"a": 2}
     await cli.close()
     await srv2.stop()
+
+
+async def test_wedged_connection_is_reset_after_repeated_timeouts(rpc):
+    _, cli = rpc
+    for _ in range(4):  # 0.3 s timeout each: the 4th is >0.9 s after the last frame
+        with pytest.raises(RpcError):
+            await cli.call("slow", {"s": 5})
+    assert await cli.call("echo", {"ok": 1}) == {"ok": 1}
+    assert cli.connects >= 2  # it dialed a fresh connection

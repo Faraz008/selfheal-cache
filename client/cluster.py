@@ -30,25 +30,38 @@ async def read_reply(r: asyncio.StreamReader):
     line = await r.readline()
     if not line:
         raise ConnectionError("connection closed")
+
     t, rest = line[:1], line[1:-2]
+
     if t == b"+":
         return rest.decode()
+
     if t == b"-":
-        return RespError(rest.decode())  # returned, not raised: keeps the connection healthy
+        return RespError(rest.decode())
+
     if t == b":":
         return int(rest)
+
     if t == b"$":
         n = int(rest)
         return None if n < 0 else (await r.readexactly(n + 2))[:-2]
+
     if t == b"*":
         n = int(rest)
         return None if n < 0 else [await read_reply(r) for _ in range(n)]
+
     raise ConnectionError(f"bad reply {line!r}")
 
 
 class _Pool:
-    def __init__(self, host: str, port: int, size: int, connect_timeout: float):
-        self.host, self.port, self.connect_timeout = host, port, connect_timeout
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        size: int,
+        connect_timeout: float,
+    ):
+        self.host, self.port, self.connect_timeout = (host, port, connect_timeout)
         self._sem = asyncio.Semaphore(size)
         self._idle: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
 
@@ -56,19 +69,24 @@ class _Pool:
     async def conn(self):
         async with self._sem:
             rw = None
+
             while self._idle:
                 cand = self._idle.pop()
                 if not cand[1].is_closing():
                     rw = cand
                     break
+
             if rw is None:
                 rw = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port), self.connect_timeout
+                    asyncio.open_connection(self.host, self.port),
+                    self.connect_timeout,
                 )
+
             try:
                 yield rw
             except BaseException:
-                rw[1].close()  # unknown protocol state (timeout, EOF): never reuse
+                # Unknown protocol state: never reuse this connection.
+                rw[1].close()
                 raise
             else:
                 self._idle.append(rw)
@@ -88,18 +106,33 @@ class ClusterClient:
         refresh_interval: float = 5.0,
         penalty: float = 3.0,
         pool_size: int = 8,
+        addr_map: dict[str, str] | None = None,
     ):
+        self._amap = addr_map or {}
+
         self._seeds = [f"{h}:{p}" for h, p in seeds]
-        self._nodes: dict[str, str] = {a: "alive" for a in self._seeds}  # "host:port" -> state
+        self._nodes: dict[str, str] = {a: "alive" for a in self._seeds}
+
         self._pools: dict[str, _Pool] = {}
         self._down_until: dict[str, float] = {}
         self._rr = itertools.count()
-        self.retries, self.request_timeout = retries, request_timeout
-        self.refresh_interval, self.penalty, self.pool_size = refresh_interval, penalty, pool_size
-        self.stats = {"requests": 0, "retries": 0, "failures": 0}
+
+        self.retries = retries
+        self.request_timeout = request_timeout
+        self.refresh_interval = refresh_interval
+        self.penalty = penalty
+        self.pool_size = pool_size
+
+        self.stats = {
+            "requests": 0,
+            "retries": 0,
+            "failures": 0,
+        }
+
         self._task: asyncio.Task | None = None
 
     # ---- lifecycle ----
+
     async def start(self) -> None:
         await self.refresh()
         self._task = asyncio.create_task(self._loop())
@@ -107,7 +140,11 @@ class ClusterClient:
     async def close(self) -> None:
         if self._task:
             self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+            await asyncio.gather(
+                self._task,
+                return_exceptions=True,
+            )
+
         for p in self._pools.values():
             p.close()
 
@@ -121,46 +158,76 @@ class ClusterClient:
     async def _loop(self) -> None:
         while True:
             await asyncio.sleep(self.refresh_interval)
+
             try:
                 await self.refresh()
             except Exception:
                 log.exception("refresh failed")
 
     # ---- topology ----
+
     def nodes(self) -> list[str]:
         return list(self._nodes)
 
+    def _parse_nodes(self, text: str) -> dict[str, str]:
+        found: dict[str, str] = {}
+
+        for line in text.splitlines():
+            f = line.split()  # id host:port state incarnation [myself]
+
+            if len(f) >= 3 and f[2] in ("alive", "suspect"):
+                found[self._amap.get(f[1], f[1])] = f[2]
+
+        return found
+
     async def refresh(self) -> bool:
-        """Learn the live node list from any reachable node (known ones first, then seeds)."""
-        for addr in [*self._nodes, *(s for s in self._seeds if s not in self._nodes)]:
+        """Learn the live node list from any reachable node."""
+
+        for addr in [
+            *self._nodes,
+            *(s for s in self._seeds if s not in self._nodes),
+        ]:
             try:
                 reply = await self._send(addr, ("CLUSTER", "NODES"))
+
             except (OSError, EOFError):
                 continue
+
             if isinstance(reply, RespError) or not reply:
                 continue
-            found: dict[str, str] = {}
-            for line in reply.decode().splitlines():
-                f = line.split()  # id host:port state incarnation [myself]
-                if len(f) >= 3 and f[2] in ("alive", "suspect"):
-                    found[f[1]] = f[2]
+
+            found = self._parse_nodes(reply.decode())
+
             if found:
                 self._nodes = found
                 return True
+
         return False
 
     def _pick(self, exclude: list[str]) -> str | None:
         now = time.monotonic()
+
         cands = [a for a in self._nodes if a not in exclude]
+
         healthy = [a for a in cands if self._down_until.get(a, 0) <= now]
-        pool = healthy or cands or list(self._nodes)  # last resort: reuse a node
+
+        pool = healthy or cands or list(self._nodes)
+
         return pool[next(self._rr) % len(pool)] if pool else None
 
     def _pool(self, addr: str) -> _Pool:
         p = self._pools.get(addr)
+
         if p is None:
             host, port = addr.rsplit(":", 1)
-            p = self._pools[addr] = _Pool(host, int(port), self.pool_size, 1.0)
+
+            p = self._pools[addr] = _Pool(
+                host,
+                int(port),
+                self.pool_size,
+                1.0,
+            )
+
         return p
 
     async def _send(self, addr: str, parts):
@@ -168,42 +235,72 @@ class ClusterClient:
             async with self._pool(addr).conn() as (r, w):
                 w.write(encode(parts))
                 await w.drain()
+
                 return await read_reply(r)
 
-    # ---- the retry engine ----
+    # ---- retry engine ----
+
     async def execute(self, *parts):
         self.stats["requests"] += 1
+
         tried: list[str] = []
         last: Exception | None = None
+
         for attempt in range(self.retries + 1):
             addr = self._pick(tried)
+
             if addr is None:
                 break
+
             tried.append(addr)
+
             if attempt:
                 self.stats["retries"] += 1
+
             try:
                 reply = await self._send(addr, parts)
-            except (OSError, EOFError) as e:  # refused, reset, EOF, timeout
+
+            except (OSError, EOFError, TimeoutError) as e:
                 last = e
                 self._down_until[addr] = time.monotonic() + self.penalty
                 continue
+
             if isinstance(reply, RespError):
-                if str(reply).startswith("CLUSTERDOWN"):  # this coordinator can't make quorum
+                if str(reply).startswith("CLUSTERDOWN"):
                     last = reply
+
+                    # Avoid repeatedly selecting a coordinator
+                    # that cannot currently achieve quorum.
+                    self._down_until[addr] = time.monotonic() + self.penalty
+
                     continue
-                raise reply  # a real command error: retrying won't help
+
+                # A real command error: retrying won't help.
+                raise reply
+
             return reply
+
         self.stats["failures"] += 1
+
         raise ClusterUnavailable(f"{len(tried)} attempt(s) failed: {last!r}") from last
 
     # ---- typed API ----
-    async def set(self, key, value, ex: int | None = None, px: int | None = None) -> bool:
+
+    async def set(
+        self,
+        key,
+        value,
+        ex: int | None = None,
+        px: int | None = None,
+    ) -> bool:
         parts = ["SET", key, value]
+
         if ex is not None:
             parts += ["EX", ex]
+
         if px is not None:
             parts += ["PX", px]
+
         return await self.execute(*parts) == "OK"
 
     async def get(self, key) -> bytes | None:

@@ -66,3 +66,9 @@ async def test_client_survives_node_death_mid_traffic(start):
         print(f"\nrequests={cl.stats['requests']} retries={cl.stats['retries']}")
         for k, v in acked.items():
             assert await cl.get(k) == v.encode()  # every acked write is readable
+
+
+def test_addr_map_translates_advertised_names():
+    cl = ClusterClient([("127.0.0.1", 1)], addr_map={"n2:7001": "127.0.0.1:7002"})
+    text = "n1 n1:7001 alive 5 myself\nn2 n2:7001 alive 9\nn3 n3:7001 dead 4\n"
+    assert cl._parse_nodes(text) == {"n1:7001": "alive", "127.0.0.1:7002": "alive"}

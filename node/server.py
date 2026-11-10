@@ -388,16 +388,35 @@ class Server:
             if opt in (b"EX", b"PX", b"EXAT", b"PXAT"):
                 if i + 1 >= len(a):
                     raise CommandError("ERR syntax error")
+
                 n = parse_int(a[i + 1])
+
                 if n <= 0:
                     raise CommandError("ERR invalid expire time in 'set' command")
+
                 if opt == b"EX":
-                    expire_at = self.coord.now() + n * 1000  # relative -> absolute, ONCE, here
+                    expire_at = self.coord.now() + n * 1000
                 elif opt == b"PX":
                     expire_at = self.coord.now() + n
                 else:
-                    expire_at = n * 1000 if opt == b"EXAT" else n  # client gave the deadline
+                    expire_at = n * 1000 if opt == b"EXAT" else n
+
                 i += 2
+
+            elif opt == b"NX":
+                if nx:
+                    raise CommandError("ERR syntax error")
+                nx = True
+                i += 1
+
+            elif opt == b"XX":
+                if xx:
+                    raise CommandError("ERR syntax error")
+                xx = True
+                i += 1
+
+            else:
+                raise CommandError("ERR syntax error")
 
         if nx and xx:
             raise CommandError("ERR syntax error")
