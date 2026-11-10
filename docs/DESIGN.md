@@ -1287,7 +1287,106 @@ The implementation still assumes:
 
 HLC reduces the impact of ordinary clock skew on version ordering. It does not make the system independent of physical time.
 
-## 12. Overall Design Limitations
+
+## 12. Verification
+
+Verification is designed to distinguish defects from behavior that is expected under an eventually consistent, leaderless system. The test harness therefore uses an explicit oracle, separates strict correctness scenarios from informational consistency experiments, and reports stale reads separately from lost writes.
+
+### 12.1 Test Oracle and Worker-Owned Keys
+
+The load generator assigns each worker its own keyspace. A worker writes and reads only keys in that worker's namespace during the concurrent workload.
+
+This ownership rule is important: it prevents two independent workers from racing to update the same key and makes the expected value for a key unambiguous. Without worker-owned keys, a test could incorrectly label a valid concurrent Last-Write-Wins outcome as data corruption.
+
+The oracle tracks the expected state for keys whose operation outcome is known:
+
+- A write that receives a successful acknowledgement updates the oracle's expected value for that key.
+- A request that fails definitively without being applied does not become an acknowledged expected write.
+- A request whose outcome is ambiguous—for example, the client times out after sending it—must not be treated as definitely failed or definitely committed. The key is marked `UNCERTAIN`.
+
+`UNCERTAIN` is an oracle state, not a value stored by the cache. It means the test cannot safely decide whether the operation took effect: the server may have committed the write even though the acknowledgement did not reach the client.
+
+The harness reports uncertain outcomes separately and excludes them from assertions that require a known expected value. It must not count an uncertain request as an acknowledged write that was lost. This avoids false failures caused by the unavoidable ambiguity between server-side execution and client-side acknowledgement.
+
+The oracle is intentionally conservative. It verifies what the client can prove from acknowledgements and later observations; it does not claim exactly-once execution or infer a definitive outcome from a timeout alone.
+
+### 12.2 TTL-Aware Oracle Checks
+
+TTL values use absolute `expire_at` timestamps in Unix milliseconds. Replication and repair must preserve that original deadline; copying a record must not restart its relative TTL.
+
+The oracle must account for the fact that a read close to an expiration deadline can race with request scheduling, network delay, and physical-clock differences. It therefore uses a configurable TTL safety margin around the deadline rather than treating a read at the exact boundary as a definitive correctness result.
+
+For a record with expiration deadline `expire_at` and configured safety margin `TTL_MARGIN_MS`:
+
+- **Clearly live:** verify the value only while the observation time is earlier than `expire_at - TTL_MARGIN_MS`.
+- **Boundary window:** observations from `expire_at - TTL_MARGIN_MS` through `expire_at + TTL_MARGIN_MS` are treated as ambiguous for the oracle. They are not used to declare a stale value or an expiration failure.
+- **Clearly expired:** verify that the value is no longer visible only after the observation time is later than `expire_at + TTL_MARGIN_MS`.
+
+The margin is a test-harness tolerance, not an extension of the record's TTL and not a change to the cache's expiration semantics. It should be selected to cover the test's expected scheduling and clock uncertainty, and the configured value should be recorded with the test configuration. The test must not silently widen the margin after observing a failure.
+
+This boundary treatment is especially important because TTL expiration depends on physical time even though record versions use HLC. HLC ordering does not make absolute expiration independent of clock accuracy.
+
+### 12.3 Strict Scenarios Versus Informational Scenarios
+
+The harness distinguishes scenarios with a deterministic correctness expectation from scenarios that deliberately expose the system's consistency trade-offs.
+
+**Strict scenarios** are pass/fail tests. They are used when the expected result follows from the configured replication and recovery behavior. A strict scenario should fail when a required request fails, when a known acknowledged value is incorrectly lost, or when a key with a known expected value returns an incorrect value outside the TTL boundary window. Any scenario-specific requirements—such as the required number of surviving copies or successful recovery after healing—must also be checked explicitly.
+
+`isolate_one` is a strict scenario. It isolates one node while the remaining cluster continues serving the workload, then heals the network and checks recovery. Its assertions focus on the scenario's promised behavior: no failed client operations in the measured run, no known acknowledged writes lost, and successful verification after recovery. Retry activity, temporary stale reads, and latency increases are recorded as diagnostic observations; they are not interchangeable with a failed write or a lost acknowledged value.
+
+**Informational scenarios** are experiments that demonstrate a documented consistency limitation rather than a behavior the implementation promises to prevent. They should complete and report their observations, but expected consistency conflicts must not be converted into a strict correctness failure.
+
+`split_3_2` is informational. During a 3/2 network partition, both sides may accept writes through sloppy quorum and stand-in nodes. The two sides can therefore acknowledge conflicting writes for the same keys. When communication returns, LWW chooses one version; it does not preserve every acknowledged concurrent value. The experiment measures divergence, read-repair progress, explicit synchronization, and which value wins. It is not a promise that every acknowledged write from both sides will survive.
+
+The distinction is deliberate:
+
+- A strict test checks a property the system is designed to guarantee under the test's stated assumptions.
+- An informational test demonstrates an expected limitation or trade-off and records the result without claiming that the limitation has been eliminated.
+
+A successful informational run means the experiment completed and produced interpretable measurements. It does not mean that all writes on both sides of a partition were preserved.
+
+### 12.4 Stale Reads and Lost Writes Are Different Measurements
+
+A **stale read** occurs when a GET returns a value older than a newer version that exists elsewhere in the cluster or is known to the test oracle. It is an observation about what a reader saw at a particular time.
+
+A stale read can be temporary. It may occur because the read consulted a replica that had not yet received the latest write, because the newest replica was not included in the read fanout, or because repair had not yet completed. Read repair, hinted handoff, or `CLUSTER SYNC` may later bring replicas into agreement.
+
+A **lost acknowledged write** is different. It means a write that received a successful client acknowledgement is not represented in the final converged state being evaluated. In a partition where both sides acknowledged conflicting values, LWW can select one winner and discard the other version. That losing acknowledged value is no longer present in the final state, even though the write was acknowledged when it occurred.
+
+Therefore:
+
+- A stale read does not by itself prove that a write was lost. The newer value may still exist on another replica and may later be returned after repair.
+- A lost acknowledged write is not merely a temporary read of an old replica. It describes a value that did not survive conflict resolution in the final state.
+- Retry counts, stale-read counts, failed-request counts, and lost-write counts measure different things and must be reported separately.
+
+The partition experiment illustrates this distinction. It observed divergence after healing, fewer divergent keys after a read sweep, and convergence after explicit `CLUSTER SYNC`. The earlier side's acknowledged values that lost the LWW comparison are reported as silently lost writes; they are not the same metric as stale reads observed during the convergence period.
+
+### 12.5 Interpreting the Recorded Partition Experiments
+
+The recorded `isolate_one` run used a five-node cluster and isolated node `n2`. The observed failure-detection time was 7.3 seconds and the heal-to-`ALIVE` time was 1.4 seconds. The run reported zero failed requests, 27 retries, and 5 stale reads. These are measurements from that run, not universal timing or availability guarantees.
+
+The recorded `split_3_2` run was informational. Each side acknowledged 200 writes to the same test keys. After healing, 200 keys were divergent; after a read sweep, 115 remained divergent; after `CLUSTER SYNC`, divergence was zero. The final values were `from-B` for all 200 keys, and 200 acknowledged writes from the losing side were reported as silently lost through LWW conflict resolution.
+
+The combined run reported 59,245 operations, zero failed requests, 11 retries, 62 stale reads, and a worst observed per-interval p99 of 1,057 ms. The load generator verified 4,608 keys with zero incorrect values under its verification rules.
+
+These measurements describe the tested execution only. In particular, zero divergence after `CLUSTER SYNC` demonstrates convergence for this experiment; it is not a proof that every possible partition, concurrent-write pattern, or failure timing will converge without loss.
+
+### 12.6 Verification Reporting Rules
+
+Test reports should keep the following categories separate:
+
+| Measurement | Meaning | How to interpret it |
+|---|---|---|
+| `failed` | Client operations that returned a failure | Availability/request outcome; a failed operation is not automatically a lost acknowledged write. |
+| `retries` | Client retries triggered by transient errors or timeouts | Recovery/transport activity; retries do not imply data loss. |
+| `stale_reads` | Reads that observed an older value than the oracle or a newer known replica version | Temporary consistency visibility issue; may be repaired later. |
+| `UNCERTAIN` | Operations whose commit outcome cannot be determined from the client response | Ambiguous result; do not classify as acknowledged success or definite loss. |
+| `lost` / silently lost acknowledged writes | Acknowledged values absent from the final state after the scenario's convergence procedure | A data-survival/conflict-resolution result, distinct from a stale read. |
+| `divergent` | Keys whose replicas disagree at the measurement point | Temporary replica disagreement; report the stage at which it was measured. |
+| `wrong` | Keys whose observed value violates a known oracle expectation outside the TTL boundary window | A strict verification mismatch. |
+| `p99` | 99th-percentile latency for the reporting interval or measurement window | Latency observation; specify whether it is interval p99 or whole-run p99. |
+
+## 13. Overall Design Limitations
 
 The current system is an educational, in-memory distributed cache implementing important Dynamo-style mechanisms. It is not intended to provide every guarantee of a production database.
 
@@ -1311,5 +1410,7 @@ The main limitations are:
 - Cleanup requires owner confirmation and can be delayed when owners are unreachable.
 
 ---
+
+*A test report must identify the scenario, configuration, observation stage, and whether the scenario is strict or informational. It must not describe an informational consistency trade-off as a strict pass/fail guarantee, and it must not combine stale reads with lost acknowledged writes into a single error count.*
 
 *This document describes the current design and intended behavior of SelfHeal Cache. Features are implemented incrementally, and the documented guarantees are limited by the implementation and the failure assumptions described above. Benchmarks and tests provide evidence for specific tested scenarios; they do not establish universal performance or correctness guarantees.*

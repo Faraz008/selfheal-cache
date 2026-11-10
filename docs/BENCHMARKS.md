@@ -890,6 +890,163 @@ Further experiments should include:
 
 ---
 
+## Phase 8 — Load Generator and Distributed Chaos Harness
+
+### Environment and Measurement Notes
+
+- Date: 10-11-2026
+- Machine: Windows laptop (WSL2)
+- OS: Ubuntu 24.04
+- Python: 3.12
+- Workload: project chaos load generator
+- Cluster: multi-node SelfHeal Cache cluster
+- Measurement type: baseline client load plus failure and partition scenarios
+
+These measurements come from the project's load generator and chaos harness. They are separate from the earlier `bench/bench.py` single-node throughput benchmarks. In particular, the load-generator throughput includes the cost of the tested distributed request path and workload configuration; it should not be compared directly with the Phase 1 single-node benchmark as if they were identical tests.
+
+### 1. Baseline Load-Generator Run
+
+The load generator was run for 30 seconds without injecting a failure.
+
+**Recorded results:**
+
+| Metric | Result |
+|---|---:|
+| Duration | 30 seconds |
+| Operations | 97,651 |
+| Throughput | approximately 3,255 ops/sec |
+| Failed operations | 0 |
+| Client retries | 0 |
+| Stale reads | 0 |
+| Keys verified | 4,609 |
+| Incorrect values | 0 |
+| Median of per-second p99 samples | 4.9 ms |
+| Arithmetic average of per-second p99 samples | 5.54 ms |
+| Maximum per-second p99 sample | 13.8 ms |
+
+The latency figures above summarize the 30 individual per-second p99 measurements. The 5.54 ms value is the arithmetic average of those per-second p99 samples; it is not the p99 latency of the entire 30-second run.
+
+**Observations:**
+
+- The baseline run completed 97,651 operations with no failed operations or client retries.
+- No stale reads were observed in this run.
+- All 4,609 keys checked by the verification pass had the expected values.
+- The measured workload throughput was approximately 3,255 operations per second.
+
+### 2. Combined Chaos Harness Summary
+
+The combined harness run exercised the distributed workload and its configured chaos scenarios.
+
+**Recorded summary:**
+
+| Metric | Result |
+|---|---:|
+| Operations | 59,245 |
+| Failed operations | 0 |
+| Client retries | 11 |
+| Stale reads | 62 |
+| Worst observed per-second p99 sample | 1,057 ms |
+| Keys verified | 4,608 |
+| Incorrect values | 0 |
+| Harness result | ALL GREEN |
+
+`ALL GREEN` means the scenarios passed the assertions configured by the harness. It does not mean that every informational metric was zero or that every scenario provides a strict data-preservation guarantee.
+
+The 62 stale reads are observations of temporarily outdated values. They are not equivalent to lost acknowledged writes. The 1,057 ms value is the worst observed per-second p99 sample reported by this run, not a separately calculated whole-run p99.
+
+**Observations:**
+
+- The harness reported zero failed operations.
+- It recorded 11 client retries and 62 stale reads during the tested scenarios.
+- The verification pass found no incorrect values among the 4,608 keys it checked.
+- The worst per-second p99 sample rose to 1,057 ms during the chaos workload, showing the latency impact of failure and recovery activity.
+
+### 3. Single-Node Isolation: Detection and Recovery
+
+The `isolate_one` scenario isolated one node while the rest of the cluster continued serving requests. The harness waited for the membership system to detect the isolated node and then measured the time for the node to return to `ALIVE` after connectivity was restored.
+
+**Recorded results:**
+
+| Metric | Result |
+|---|---:|
+| Scenario | `isolate_one` |
+| Isolated node | n2 |
+| Time to detect failure (`DEAD`) | 7.3 seconds |
+| Time from healing to `ALIVE` | 1.4 seconds |
+| Failed client requests | 0 |
+| Client retries | 27 |
+| Stale reads | 5 |
+| Worst observed per-second p99 sample | 1,155 ms |
+| Lost acknowledged writes | 0 |
+| Scenario result | PASS |
+
+**Interpretation:**
+
+- The cluster detected the isolated node as `DEAD` in 7.3 seconds.
+- After the network was healed, the node returned to `ALIVE` in 1.4 seconds.
+- Client requests continued without a reported failed request, although 27 retries and 5 stale reads were observed.
+- The worst per-second p99 sample reached 1,155 ms during this scenario.
+- The harness reported zero lost acknowledged writes for this particular isolated-node experiment.
+
+The 1.4-second recovery measurement is the observed time from healing connectivity until membership reported the node as `ALIVE`. It is not a measurement of full historical-data synchronization or a guarantee that every recovery path completes within 1.4 seconds.
+
+### 4. Three-versus-Two Network Partition: Informational Scenario
+
+The `split_3_2` scenario divided the five-node cluster into partitions of three and two nodes. It was configured as informational (`strict=False`), because both sides can acknowledge conflicting writes through sloppy quorum and the system uses last-write-wins (LWW) conflict resolution.
+
+**Recorded results:**
+
+| Metric | Result |
+|---|---:|
+| Partition layout | 3 nodes vs. 2 nodes |
+| Acknowledged writes on side A | 200 |
+| Acknowledged writes on side B | 200 |
+| Divergent keys after healing | 200 |
+| Divergent keys after read sweep | 115 |
+| Divergent keys after `CLUSTER SYNC` | 0 |
+| Final winning values | `from-B: 200` |
+| Acknowledged writes that lost LWW resolution | 200 |
+
+Both sides acknowledged 200 writes while partitioned. After healing, the two sides had conflicting versions for 200 keys. The read sweep reduced the remaining divergence to 115 keys, and explicit `CLUSTER SYNC` reduced it to zero. The final values were all from side B.
+
+The 200 `acked_writes_silently_lost` count describes acknowledged side-A values that lost conflict resolution to the later side-B versions. It does not mean that 200 client requests failed. Both sides acknowledged their writes, but LWW can retain only one winning value for each conflicting key.
+
+This scenario is intentionally informational rather than a strict zero-loss test. It demonstrates the consistency trade-off of accepting writes on both sides of a network partition; it must not be described as preserving every acknowledged conflicting value.
+
+### 5. How to Interpret the Measurements
+
+The three measurements answer different questions:
+
+- **Baseline load generator:** What throughput and latency did the distributed client workload achieve without injected failure?
+- **`isolate_one`:** Could the remaining cluster continue serving requests while one node was isolated, and how quickly did membership detect and recognize recovery?
+- **`split_3_2`:** What happens when both sides of a partition accept conflicting writes, and how do read repair and explicit synchronization converge the data afterward?
+
+A stale read is a read that returns an older value than the latest value known to have been written. It can occur temporarily while replicas converge. A lost acknowledged write is a value that was acknowledged to a client but is not retained as the winning value after the system resolves conflicts or recovers. These are distinct measurements and should be reported separately.
+
+### 6. Limitations
+
+- These are recorded development experiments from WSL2, not statistically controlled production benchmarks.
+- The baseline load-generator run and combined chaos run use different execution conditions and should not be compared as a controlled before/after performance test.
+- The per-second p99 summaries are not equivalent to a percentile calculated over every request in the complete run.
+- The isolation and partition results are individual recorded experiments, not averages across repeated trials.
+- The `isolate_one` recovery time measures membership returning to `ALIVE`, not complete verification of all historical data.
+- The `split_3_2` scenario intentionally permits acknowledgements on both sides and therefore cannot establish preservation of every conflicting acknowledged value.
+- `ALL GREEN` means the configured harness assertions passed; informational scenario metrics may still report stale reads, retries, latency spikes, or acknowledged values that lost LWW conflict resolution.
+
+### 7. Conclusion
+
+The baseline load-generator run completed 97,651 operations in 30 seconds at approximately 3,255 ops/sec, with zero failed operations, zero retries, zero stale reads, and no incorrect values among 4,609 verified keys.
+
+The combined chaos harness reported 59,245 operations, zero failed operations, 11 retries, 62 stale reads, and no incorrect values among 4,608 verified keys. Its worst observed per-second p99 sample was 1,057 ms.
+
+In the strict single-node isolation scenario, the cluster detected n2 in 7.3 seconds and reported it `ALIVE` 1.4 seconds after healing. The run recorded zero failed requests and zero lost acknowledged writes, with 27 retries and 5 stale reads.
+
+The informational 3-vs-2 partition scenario showed the expected LWW trade-off: both sides acknowledged writes, but 200 side-A values lost to the final side-B versions. Read repair and `CLUSTER SYNC` brought the observed divergence down to zero.
+
+Together, these experiments provide measured evidence of baseline distributed workload behavior, failure detection, membership recovery, and partition convergence. They do not establish general production guarantees or preservation of conflicting acknowledged writes under every partition.
+
+---
+
 ## Overall Benchmark Summary
 
 | Phase | Component | Main Result |
@@ -909,10 +1066,15 @@ Further experiments should include:
 | Phase 6 | Join/leave under load | PASS; 320,042 acknowledged writes, 0 failed requests, 0 lost acknowledged writes |
 | Phase 7 | Single-node benchmark | 18,450 ops/sec |
 | Phase 7 | Single-node benchmark (100 clients) | 16,823 ops/sec |
+| Phase 8 | Baseline distributed load generator | 97,651 ops in 30 seconds; ~3,255 ops/sec; 0 failures |
+| Phase 8 | Combined chaos harness | 59,245 ops; 0 failures; 11 retries; 62 stale reads; 0 incorrect verified values |
+| Phase 8 | Single-node isolation detection | 7.3 seconds to report `DEAD` |
+| Phase 8 | Single-node isolation recovery | 1.4 seconds from healing to `ALIVE` |
+| Phase 8 | 3-vs-2 partition convergence | 200 divergent keys after healing; 0 after `CLUSTER SYNC`; 200 side-A values lost LWW resolution |
 
 ## Overall Conclusion
 
-The benchmarks establish initial performance and behavior baselines for SelfHeal Cache.
+The benchmarks establish performance and behavior baselines for SelfHeal Cache across the single-node server, hashing ring, membership, replication, rebalancing, TTL, and chaos-testing work.
 
 - **Phase 1:** The single-node RESP server achieved approximately 30k operations per second.
 - **Phase 2:** Consistent hashing reduced key movement during membership changes, with low lookup overhead and reasonably balanced key distribution.
@@ -920,9 +1082,10 @@ The benchmarks establish initial performance and behavior baselines for SelfHeal
 - **Phase 4:** The single-node benchmark showed a throughput regression compared with Phase 1. A separate five-node chaos experiment passed its acknowledged-write verification during one node failure and restart scenario.
 - **Phase 6:** The cluster completed a node join and graceful leave while handling concurrent writes. The recorded run reported zero failed requests and zero lost acknowledged writes, with an estimated join transfer rate of approximately 4,519 keys/sec.
 - **Phase 7:** The single-node benchmark recorded 18,450 ops/sec by default and 16,823 ops/sec with 100 clients after implementing HLC-based versioning and TTL consistency changes.
+- **Phase 8:** The baseline distributed load generator achieved approximately 3,255 ops/sec. The strict isolation scenario detected a node failure in 7.3 seconds and observed membership recovery 1.4 seconds after healing. The partition experiment demonstrated convergence after read repair and `CLUSTER SYNC`, while also exposing the expected LWW loss of conflicting acknowledged values.
 
-The results demonstrate progress in the cache's distributed functionality, but they also show that single-node throughput has decreased from the initial baseline.
+The single-node `bench/bench.py` results and the distributed chaos load-generator results measure different workloads and should not be treated as directly comparable throughput numbers. The chaos results also distinguish stale reads, failed requests, and acknowledged values that lose conflict resolution; these are not interchangeable correctness metrics.
 
-The next performance priority should be to identify the cause of the throughput regression using equivalent benchmark configurations, repeated trials, and profiling.
+The next performance priority remains identifying the cause of the single-node throughput regression using equivalent benchmark configurations, repeated trials, and profiling. Further chaos work should repeat the failure and partition scenarios and record distributions rather than relying on one run.
 
 All measurements should be treated as experimental results from the tested WSL2 environment, not statistically validated performance guarantees.
