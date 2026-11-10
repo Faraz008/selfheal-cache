@@ -920,7 +920,7 @@ The table below summarizes the recorded load-generator and chaos experiments. Th
 
 The plot below is the captured output from the full chaos harness run:
 
-![SelfHeal Cache chaos harness results](docs/chaos_run.png)
+![SelfHeal Cache chaos harness results](docs/img/chaos_run.png)
 
 ### What these results mean
 
