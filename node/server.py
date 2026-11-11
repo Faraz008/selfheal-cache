@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 from . import resp
 from .clock import hlc_ms
@@ -224,17 +225,16 @@ class Server:
 
     async def _sweep_loop(self) -> None:
         interval = self.cfg.sweep_interval_ms / 1000
-
+        decay = self.cfg.lfu_decay_ms / 1000
+        next_age = time.monotonic() + decay
         while True:
             await asyncio.sleep(interval)
-
             removed = self.store.sweep()
-
             if removed:
-                log.debug(
-                    "sweeper collected %d records",
-                    removed,
-                )
+                log.debug("sweeper collected %d records", removed)
+            if time.monotonic() >= next_age:
+                self.store.age()  # no-op for LRU
+                next_age = time.monotonic() + decay
 
     # ---- connection handling ----
 
@@ -328,6 +328,16 @@ class Server:
             f"keys_cleaned:{r['keys_cleaned']}",
         ]
 
+        st = self.store
+        lines += [
+            f"consistency:{self.cfg.consistency}",
+            f"used_memory:{st.mem}",
+            f"max_memory:{st.max_bytes}",
+            f"eviction_policy:{self.cfg.eviction_policy if st.max_bytes else 'none'}",
+            f"evictions:{st.evictions}",
+            f"evict_blocked:{st.evict_blocked}",
+            f"expired_shrunk:{st.shrunk}",
+        ]
         return resp.bulk(("\n".join(lines) + "\n").encode())
 
     async def cmd_cluster(self, a):

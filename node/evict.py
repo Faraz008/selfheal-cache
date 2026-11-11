@@ -1,6 +1,6 @@
 from collections import OrderedDict
 
-OVERHEAD = 120  # bytes charged per record beyond key+value; calibrated on Day 35
+OVERHEAD = 261  # bytes charged per record beyond key+value; calibrated on Day 35
 MAX_FREQ = 255  # saturating counter: bounds the number of distinct frequency buckets
 LFU_INIT = 3  # new keys start above 1 so they get a chance before being evicted
 

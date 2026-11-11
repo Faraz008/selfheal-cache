@@ -2,7 +2,7 @@ import random
 
 import pytest
 
-from node.evict import record_size
+from node.evict import LFU, record_size
 from node.store import KeyIndex, Record, Store
 
 from .test_store import FakeClock, rec
@@ -128,3 +128,56 @@ def test_key_index_matches_a_plain_set():
         assert len(idx) == len(ref)
     assert set(idx.sample(1000)) == ref
     assert all(k in idx for k in ref)
+
+
+def test_lfu_survives_a_scan_that_flushes_lru(clock):
+    kept = {}
+    for policy in ("lru", "lfu"):
+        s = make(clock, 5, policy)
+        s.apply(b"h0", rec(VAL, 1))
+        for _ in range(20):
+            s.get_record(b"h0", touch=True)  # a genuinely hot key
+        for i in range(8):  # a one-off scan of cold keys
+            s.apply(f"c{i}".encode(), rec(VAL, 10 + i))
+        kept[policy] = s.get_record(b"h0") is not None
+    assert kept == {"lru": False, "lfu": True}
+
+
+def test_lfu_ties_fall_back_to_least_recently_used():
+    p = LFU()
+    for k in (b"a", b"b", b"c"):
+        p.add(k)
+    assert p.victim() == b"a"
+    assert p.victim(protect=b"a") == b"b"
+    p.touch(b"a")
+    assert p.victim() == b"b"
+
+
+def test_lfu_counter_saturates():
+    p = LFU()
+    p.add(b"a")
+    for _ in range(1000):
+        p.touch(b"a")
+    assert p.freq(b"a") == 255
+
+
+def test_lfu_aging_halves_and_lets_stale_keys_go():
+    p = LFU()
+    p.add(b"a")
+    for _ in range(10):
+        p.touch(b"a")
+    assert p.freq(b"a") == 13
+    p.age()
+    assert p.freq(b"a") == 6
+    p.age()
+    p.age()
+    assert p.freq(b"a") == 1  # floor of 1: aged keys are cold, not forgotten
+    p.add(b"fresh")
+    assert p.victim() == b"a"  # yesterday's hot key now loses to a new one
+
+
+def test_lfu_remove_cleans_up_buckets():
+    p = LFU()
+    p.add(b"a")
+    p.remove(b"a")
+    assert len(p) == 0 and p.victim() is None

@@ -1,0 +1,17 @@
+
+zipf: hit rate by cache size (fraction of keyspace)
+  size      LRU      LFU
+    1%    47.5%    57.3%
+    2%    54.7%    62.6%
+    5%    64.3%    68.7%
+   10%    71.5%    73.6%
+   20%    78.6%    79.1%
+
+zipf + scans: hit rate by cache size (fraction of keyspace)
+  size      LRU      LFU
+    1%    31.6%    38.2%
+    2%    36.1%    41.3%
+    5%    41.5%    45.0%
+   10%    44.2%    47.4%
+   20%    44.5%    47.9%
+wrote docs/img/eviction_hit_rate.png
