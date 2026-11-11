@@ -7,7 +7,7 @@ x-node: &node
   networks: [cache]
   stop_grace_period: 3s
   volumes:
-    - ./docker/node.json:/etc/cache/node.json:ro
+    - ${NODE_CONFIG:-./docker/node.json}:/etc/cache/node.json:ro
   healthcheck:                  # healthy == the node reports state:alive
     test: ["CMD", "python", "-c", "import socket,sys; s=socket.create_connection(('127.0.0.1',7001),1); s.sendall(b'INFO\\r\\n'); sys.exit(0 if b'state:alive' in s.recv(4096) else 1)"]
     interval: 2s

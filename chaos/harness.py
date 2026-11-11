@@ -168,6 +168,7 @@ async def amain(default_names: list[str]) -> int:
         await sh("up")
     client = make_client(retries=1, request_timeout=3.0)
     await client.start()
+    print("consistency mode:", (await info("n1") or {}).get("consistency", "?"))
     w = Workload(client, workers=a.workers, seed=a.seed)
     h = Harness(w, a.seed)
     await w.start()

@@ -1,0 +1,6 @@
+{
+  "host": "0.0.0.0", "port": 7001, "rpc_port": 8001,
+  "replicas": 3, "write_acks": 2, "read_fanout": 2,
+  "consistency": "quorum", "read_quorum": 2,
+  "join_max_wait_ms": 6000, "log_level": "INFO"
+}

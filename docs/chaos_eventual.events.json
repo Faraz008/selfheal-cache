@@ -1,0 +1,1 @@
+[[8, "== kill_one =="], [8, "KILL n2"], [17, "START n2"], [26, "== pause_one =="], [26, "PAUSE n5"], [36, "UNPAUSE n5"], [42, "== kill_two =="], [42, "KILL n1 + n3"], [54, "START n1 + n3"], [62, "== grow =="], [62, "ADD n6"], [72, "== shrink =="], [72, "LEAVE n1"], [82, "== kill_one =="], [82, "KILL n5"], [92, "START n5"]]
