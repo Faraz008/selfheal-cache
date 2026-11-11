@@ -50,8 +50,7 @@ async def read_repair(start):
     c = await connect(servers[0].port)
     want = deadline()
     await c.cmd("SET", "k", "v", "PXAT", want)
-    servers[2].store._data.pop(b"k")  # simulate a replica that missed the write
-    servers[2].store._expiring.discard(b"k")
+    servers[2].store._remove(b"k")
     await c.cmd("GET", "k")  # triggers the background repair
     return servers[2], b"k", want
 

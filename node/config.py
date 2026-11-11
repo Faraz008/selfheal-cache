@@ -4,6 +4,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def parse_size(s: str) -> int:
+    """'64mb' -> 67108864, '1.5k' -> 1536, '500' -> 500."""
+    s = s.strip().lower().removesuffix("b")
+    units = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}
+
+    try:
+        if s and s[-1] in units:
+            return int(float(s[:-1]) * units[s[-1]])
+        return int(s)
+    except ValueError:
+        raise SystemExit(f"bad size {s!r}") from None
+
+
 @dataclass(frozen=True)
 class Member:
     node_id: str
@@ -86,7 +99,8 @@ class NodeConfig:
     sync_on_start: bool = True
     # Static-member nodes catch up from peers at boot.
 
-    max_clock_skew_ms: int = 5000  # bound on wall-clock disagreement we plan for
+    max_clock_skew_ms: int = 5000
+    # Bound on wall-clock disagreement we plan for.
 
     # Cleanup
     cleanup_interval_ms: int = 5000
@@ -98,6 +112,15 @@ class NodeConfig:
     # Graceful leave and sessions
     leave_timeout_ms: int = 120_000
     session_ttl_ms: int = 60_000
+
+    # Consistency
+    consistency: str = "eventual"  # "eventual" | "quorum"
+    read_quorum: int = 2  # R; used only in quorum mode
+
+    # Memory management
+    max_memory_bytes: int = 0  # 0 = unlimited
+    eviction_policy: str = "lru"  # "lru" | "lfu"
+    lfu_decay_ms: int = 60_000
 
     log_level: str = "INFO"
 
@@ -194,6 +217,26 @@ class NodeConfig:
         if self.tombstone_grace_ms < 2 * self.max_clock_skew_ms:
             raise SystemExit("tombstone_grace_ms must be at least 2x max_clock_skew_ms")
 
+        # Validate consistency configuration.
+        if self.consistency not in ("eventual", "quorum"):
+            raise SystemExit("consistency must be 'eventual' or 'quorum'")
+
+        if self.eviction_policy not in ("lru", "lfu"):
+            raise SystemExit("eviction_policy must be 'lru' or 'lfu'")
+
+        if self.max_memory_bytes < 0:
+            raise SystemExit("max_memory_bytes must be >= 0")
+
+        if self.consistency == "quorum":
+            if not 1 <= self.read_quorum <= self.replicas:
+                raise SystemExit("read_quorum must be between 1 and replicas")
+
+            if self.read_quorum + self.write_acks <= self.replicas:
+                raise SystemExit(
+                    f"quorums must overlap: read_quorum({self.read_quorum}) + "
+                    f"write_acks({self.write_acks}) must exceed replicas({self.replicas})"
+                )
+
     @classmethod
     def load(cls, argv: list[str] | None = None) -> "NodeConfig":
         """Precedence: defaults < JSON file < CLI flags."""
@@ -217,6 +260,12 @@ class NodeConfig:
         p.add_argument("--replicas", type=int)
         p.add_argument("--write-acks", type=int)
         p.add_argument("--log-level")
+
+        # Consistency and memory CLI options.
+        p.add_argument("--consistency")
+        p.add_argument("--read-quorum", type=int)
+        p.add_argument("--eviction-policy")
+        p.add_argument("--max-memory", help="e.g. 64mb")
 
         a = p.parse_args(argv)
 
@@ -247,6 +296,9 @@ class NodeConfig:
             "advertise_host",
             "replicas",
             "write_acks",
+            "consistency",
+            "read_quorum",
+            "eviction_policy",
             "log_level",
         )
 
@@ -261,6 +313,9 @@ class NodeConfig:
 
         if a.seeds is not None:
             cfg.seeds = [x for x in a.seeds.split(",") if x]
+
+        if a.max_memory is not None:
+            cfg.max_memory_bytes = parse_size(a.max_memory)
 
         cfg.validate()
 

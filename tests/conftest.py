@@ -153,12 +153,23 @@ async def start():
     started: list[Server] = []
 
     async def _start(cfg: NodeConfig, clock=None) -> Server:
-        store = Store(clock, cfg.tombstone_grace_ms) if clock is not None else None
+        store = (
+            Store(
+                clock,
+                cfg.tombstone_grace_ms,
+                max_bytes=cfg.max_memory_bytes,
+                policy=cfg.eviction_policy,
+            )
+            if clock is not None
+            else None
+        )
+
         s = Server(cfg, store)
         await s.start()
         started.append(s)
         return s
 
     yield _start
+
     for s in started:
         await s.stop()

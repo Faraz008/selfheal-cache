@@ -1,1 +1,1 @@
-[[8, "== isolate_one =="], [8, "ISOLATE n2"], [35, "HEAL"], [43, "== split_3_2 =="], [43, "SPLIT ['n1', 'n2', 'n3'] | ['n4', 'n5']"], [65, "HEAL"]]
+[[8, "== kill_one =="], [8, "KILL n2"], [18, "START n2"], [27, "== pause_one =="], [27, "PAUSE n5"], [38, "UNPAUSE n5"], [43, "== kill_two =="], [43, "KILL n1 + n3"], [54, "START n1 + n3"], [62, "== grow =="], [62, "ADD n6"], [73, "== shrink =="], [73, "LEAVE n1"], [82, "== kill_one =="], [82, "KILL n5"], [92, "START n5"]]

@@ -112,7 +112,7 @@ class Coordinator:
         return self.store.apply(b64d(a["k"]), self.observe(rec_from_wire(a["r"])))
 
     async def _rpc_get(self, a):
-        rec = self.store.get_record(b64d(a["k"]))
+        rec = self.store.get_record(b64d(a["k"]), touch=True)
         return None if rec is None else rec_to_wire(rec)
 
     async def _rpc_hint(self, a):
@@ -159,7 +159,7 @@ class Coordinator:
     async def _fetch(self, nid: str, key: bytes) -> Record | None:
         """Raw record (tombstones included) from one replica. Raises RpcError."""
         if nid == self.id:
-            return self.store.get_record(key)
+            return self.store.get_record(key, touch=True)
 
         d = await self.peers.call(
             nid,

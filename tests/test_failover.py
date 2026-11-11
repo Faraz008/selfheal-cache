@@ -142,7 +142,7 @@ async def test_read_repair_heals_replica_missing_a_write(start):
     servers = [await start(c) for c in static_cfgs(3, replicas=3, write_acks=3, read_fanout=3)]
     c = await connect(servers[0].port)
     await c.cmd("SET", "k", "v")
-    servers[2].store._data.pop(b"k")  # simulate a replica that missed the write
+    servers[2].store._remove(b"k")  # simulate a replica that missed the write
     assert servers[2].store.get_record(b"k") is None
     assert await c.cmd("GET", "k") == b"v"  # client is served immediately
 

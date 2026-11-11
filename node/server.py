@@ -32,7 +32,15 @@ class Server:
         cfg.validate()
 
         self.cfg = cfg
-        self.store = store if store is not None else Store(grace_ms=cfg.tombstone_grace_ms)
+        self.store = (
+            store
+            if store is not None
+            else Store(
+                grace_ms=cfg.tombstone_grace_ms,
+                max_bytes=cfg.max_memory_bytes,
+                policy=cfg.eviction_policy,
+            )
+        )
 
         # ---- membership and cluster communication ----
 
