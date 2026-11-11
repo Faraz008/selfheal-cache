@@ -244,21 +244,27 @@ class Coordinator:
         order, joining = self.read_plan(key)
         if not order:
             raise ClusterError("empty ring")
-        want = min(self.cfg.read_fanout + joining, len(order))
+        base = self.cfg.read_quorum if self.strict else self.cfg.read_fanout
+        want = min(base + joining, len(order))
         answers, err = await self._gather_answers(key, order, want)
+        if self.strict and len(answers) < want:
+            self.stats["quorum_read_failures"] += 1
+            raise ClusterError(f"read quorum not reached ({len(answers)}/{want} answers)") from err
         if not answers:
             raise ClusterError("no replica reachable") from err
         best = self.newest(answers.values())
         if best is not None:
             owners = set(self.preference_list(key))
-            # repair OWNERS only: the displaced old replica must not be handed a stray copy
             stale = [
                 n
                 for n, r in answers.items()
                 if n in owners and (r is None or r.version < best.version)
             ]
             if stale:
-                self._spawn(self._repair(key, best, stale))
+                if self.strict:
+                    await self._repair(key, best, stale)  # finish BEFORE replying
+                else:
+                    self._spawn(self._repair(key, best, stale))
         return best if best is not None and best.is_live(self.now()) else None
 
     async def _repair(self, key: bytes, best: Record, stale: list[str]) -> None:
