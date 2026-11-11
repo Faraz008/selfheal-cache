@@ -313,6 +313,8 @@ class Server:
             f"hints_rejected:{self.hints.rejected}",
             f"hints_written:{s['hints_written']}",
             f"read_repairs:{s['read_repairs']}",
+            f"quorum_write_failures:{s['quorum_write_failures']}",
+            f"quorum_read_failures:{s['quorum_read_failures']}",
             f"clock_drift_rejects:{self.coord.versions.rejected}",
             f"hlc_lead_ms:{hlc_ms(self.coord.versions.last) - self.store.now()}",
         ]

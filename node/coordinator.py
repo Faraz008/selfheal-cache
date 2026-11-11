@@ -359,46 +359,38 @@ class Coordinator:
 
         return False
 
-    async def _replicate(
-        self,
-        key: bytes,
-        rec: Record,
-    ) -> None:
-        pref = self.preference_list(key)
+    @property
+    def strict(self) -> bool:
+        return self.cfg.consistency == "quorum"
 
+    @staticmethod
+    async def _wait_acks(tasks, need: int) -> int:
+        pending, acks = set(tasks), 0
+        while pending and acks < need:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            acks += sum(t.result() for t in done)
+        return acks
+
+    async def _replicate(self, key: bytes, rec: Record) -> None:
+        pref = self.preference_list(key)
         if not pref:
             raise ClusterError("empty ring")
-
         need = min(self.cfg.write_acks, len(pref))
-
-        for n in self.extras(key, pref):
+        for n in self.extras(key, pref):  # future owners of a LEAVING node: best effort
             if not self.m.is_dead(n):
                 self._spawn(self._put(n, key, rec))
-
-        standins = self._standin_iter(key)
-
-        tasks = [
-            self._spawn(
-                self._write_slot(
-                    owner,
-                    key,
-                    rec,
-                    standins,
-                )
-            )
-            for owner in pref
-        ]
-
-        pending, acks = set(tasks), 0
-
-        while pending and acks < need:
-            done, pending = await asyncio.wait(
-                pending,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            acks += sum(t.result() for t in done)
-
+        if self.strict:
+            # Preference list ONLY. No stand-ins, no hints. We even try nodes we believe
+            # DEAD: the detector can be wrong, and we only wait for `need` acks anyway.
+            tasks = [self._spawn(self._put(o, key, rec)) for o in pref]
+        else:
+            standins = self._standin_iter(key)
+            tasks = [self._spawn(self._write_slot(o, key, rec, standins)) for o in pref]
+        acks = await self._wait_acks(tasks, need)
         if acks < need:
+            if self.strict:
+                self.stats["quorum_write_failures"] += 1
+                raise ClusterError(f"write quorum not reached ({acks}/{need} acks)")
             raise ClusterError(f"write acked by {acks}/{need} replicas")
 
     def observe(self, rec: Record) -> Record:
