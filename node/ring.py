@@ -117,7 +117,7 @@ def ring_diff(old: Ring, new: Ring, n: int) -> list[Move]:
     Result is sorted, disjoint, and within [0, 2**64)."""
     edges = sorted({0, MAX_HASH, *old.tokens(), *new.tokens()})
     moves: list[Move] = []
-    for lo, hi in zip(edges, edges[1:], strict=True):
+    for lo, hi in zip(edges, edges[1:], strict=False):
         o, w = old.prefs_at(lo, n), new.prefs_at(lo, n)
         if set(o) == set(w):
             continue
