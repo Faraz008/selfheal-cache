@@ -7,6 +7,8 @@ A sharded, replicated, self-healing in-memory cache cluster, written from scratc
 
 ![demo](docs/img/demo.gif)
 
+![Eventual consistency during chaos](docs/img/chaos_eventual.png)
+
 *A node is `kill -9`ed mid-traffic. The dashboard shows `err=0` throughout; clients retry at most once.*
 
 ## What it proves
@@ -64,7 +66,7 @@ async with ClusterClient([("127.0.0.1", 7001)], retries=1) as cl:
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for diagrams and request lifecycles, and
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for diagrams and request lifecycles, and
 [docs/DESIGN.md](docs/DESIGN.md) for every decision and its trade-off.
 
 ## Tunable consistency

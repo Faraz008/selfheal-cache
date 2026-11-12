@@ -29,7 +29,7 @@ The project focuses on implementing and understanding distributed-systems mechan
 
 ## 2. Architecture Overview
 
-See [architecture.md](architecture.md) for architecture diagrams and request lifecycles.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for architecture diagrams and request lifecycles.
 
 The cluster follows a leaderless, Dynamo-style architecture. Every node can receive client requests and coordinate reads and writes.
 
