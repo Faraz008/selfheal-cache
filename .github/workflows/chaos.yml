@@ -1,0 +1,16 @@
+name: chaos
+on: workflow_dispatch
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev,analysis]"
+      - run: sudo apt-get update && sudo apt-get install -y redis-tools
+      - run: python -m chaos.harness --scenarios kill_one,pause_one,grow,shrink --csv docs/chaos_ci.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: chaos, path: docs/chaos_ci.* }

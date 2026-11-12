@@ -1,3 +1,5 @@
+![ci](https://github.com/Faraz008/selfheal-cache/actions/workflows/ci.yml/badge.svg)
+
 # selfheal-cache
 
 A sharded, replicated, self-healing in-memory cache cluster, written from scratch in Python
