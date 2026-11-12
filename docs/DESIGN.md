@@ -1,1477 +1,1152 @@
-\# SelfHeal Cache — Design Document
+# SelfHeal Cache — Design Document
 
-## 1. Goals
+## 1. Goals and Non-Goals
 
-SelfHeal Cache is a leaderless, Dynamo-style distributed in-memory key-value store designed to remain available and recover from node failures.
+SelfHeal Cache is a leaderless, Dynamo-style distributed in-memory key-value store built from scratch in Python using `asyncio`.
 
-The seven core project goals are:
+### Goals
 
 1. Provide a Redis-compatible RESP interface for client operations.
-2. Use a leaderless architecture without a centralized coordinator.
-3. Distribute keys across nodes using consistent hashing.
-4. Replicate data across multiple nodes for availability.
-5. Support eventual consistency with Last-Write-Wins (LWW) conflict resolution by default.
-6. Detect node failures and recover through distributed coordination and synchronization.
-7. Support TTL-based expiration and anti-entropy repair to remove stale or missing data.
+2. Allow any node to coordinate requests without a permanent leader.
+3. Distribute keys using consistent hashing and virtual nodes.
+4. Replicate data across distinct physical nodes.
+5. Provide eventual consistency with Last-Write-Wins (LWW) conflict resolution by default.
+6. Detect node failures and recover through failover, hinted handoff and synchronization.
+7. Support absolute-deadline TTL expiration, tombstones and safe garbage collection.
+8. Support dynamic membership, historical data transfer and ownership cleanup.
+9. Provide optional quorum consistency and memory-bounded LRU/LFU eviction.
 
-## 2. Architecture
+### Non-Goals
 
-The system follows a leaderless, Dynamo-style architecture. Any node can coordinate a client request; there is no permanent primary node responsible for all writes.
+- Disk persistence or crash-safe recovery.
+- Transactions or general exactly-once execution.
+- Linearizability or consensus-based coordination.
+- Automatic preservation of every concurrent write.
+- WAN-scale membership and replication.
+- Authentication, authorization or encrypted communication.
 
-Consistent hashing determines which nodes are responsible for a given key. Data is replicated across a configurable number of nodes.
+The project focuses on implementing and understanding distributed-systems mechanisms, not replacing a production database.
+
+## 2. Architecture Overview
+
+See [architecture.md](architecture.md) for architecture diagrams and request lifecycles.
+
+The cluster follows a leaderless, Dynamo-style architecture. Every node can receive client requests and coordinate reads and writes.
 
 Each node exposes two separate network interfaces:
 
-- Client interface: Uses RESP on the client-facing port to accept Redis-style commands such as `SET`, `GET`, and `DEL`.
-- Internal interface: Uses a separate internal protocol and port for node-to-node communication, including replication, membership gossip, failure detection, and synchronization.
+| Interface | Purpose |
+|---|---|
+| Client interface | RESP protocol for Redis-compatible commands |
+| Internal interface | Node-to-node communication for replication, membership, failure detection and synchronization |
 
-Keeping the client and internal protocols separate allows client compatibility without coupling distributed-system communication to RESP.
+The internal RPC protocol uses length-prefixed JSON messages. It is separate from the client-facing RESP protocol.
 
-Nodes use distributed failure detection and anti-entropy mechanisms to identify unavailable peers and repair inconsistent data.
+A typical write follows this path:
 
-## 3. Guarantees
+1. A client sends a command to any node.
+2. That node becomes the coordinator for the request.
+3. The coordinator calculates the key's preference list using the ring.
+4. It creates a version and expiration deadline where applicable.
+5. It sends the record to the intended replicas.
+6. Replicas apply the record using version comparison.
+7. The coordinator collects acknowledgements according to the configured consistency mode.
+8. The client receives the result.
 
-- Eventual consistency: In the default operating mode, replicas may temporarily contain different values but are expected to converge when communication is restored and synchronization completes.
-- Last-Write-Wins (LWW): Conflicting updates are resolved using versions. The record with the latest version wins according to the HLC timestamp and node-ID tie-breaker.
-- TTL: Expiration is represented as an absolute Unix timestamp in milliseconds, rather than a relative duration. Replicas therefore share the same expiration deadline instead of restarting the TTL when data is copied.
-- Quorum mode: Configurable read and write acknowledgement requirements provide stronger consistency behavior in cases where the acknowledgement sets overlap. This does not make every operation strongly consistent, particularly when sloppy quorum uses stand-in nodes.
+The read path consults replicas, compares available versions and performs read repair when required.
 
-## 4. Non-Guarantees
+Membership gossip and failure detection operate independently of normal client requests. Rebalancing handles historical data movement when ownership changes.
 
-- No durability or persistence: Data is held in memory and may be lost when a node or process restarts.
-- No transactions: Multiple operations are not guaranteed to execute atomically as a single transaction.
-- No default strong consistency: The default operating mode provides eventual consistency with LWW conflict resolution. Strong consistency is not guaranteed merely by enabling quorum settings.
-- No protection against every failure scenario: Recovery and availability depend on the number of surviving replicas and the ability of nodes to communicate.
-- No exactly-once execution: Client retries can repeat operations. Versioning helps replicas converge but does not provide general exactly-once semantics.
-- No perfect clock synchronization: HLC reduces dependence on physical clock ordering, but TTL and HLC drift validation still depend on reasonably accurate physical clocks.
+## 3. Data Model: Records, Versions, Tombstones and TTL
 
-## 5. Assumptions
+### 3.1 Record
 
-- Reasonably synchronized clocks: Nodes are expected to have reasonably synchronized clocks through NTP. HLC reduces the impact of small clock differences on version ordering, but absolute TTL deadlines and clock-drift validation still depend on physical time.
-- Bounded clock drift: The implementation uses a configurable `max_clock_skew_ms` limit when deciding whether to accept a remote HLC timestamp that is ahead of the local clock.
-- Trusted network: Nodes communicate over a trusted network.
-- No authentication: Client and internal communication do not include authentication or authorization in the current design.
-- In-memory operation: The system prioritizes fast access over persistence and crash-safe recovery.
-- Stable node identity: A node retains the same unique node ID across restarts. IDs such as `n1` and `n2` are used instead of generating a new random ID on every boot.
+A stored record represents the latest known state of a key.
 
-## 6. Replication and Versioning
+Its logical fields are:
 
-### 6.1 Last-Write-Wins (LWW)
+- `key`: The key being stored.
+- `value`: The stored value, or `None` for a tombstone.
+- `version`: An HLC integer.
+- `expire_at`: An absolute Unix timestamp in milliseconds, or no deadline.
 
-Every record has a version represented as a tuple:
-
-`(hlc_timestamp, node_id)`
-
-The HLC timestamp is a hybrid logical timestamp generated by the coordinator. The node ID provides a deterministic tie-breaker when two records have the same HLC timestamp.
-
-Replicas compare versions lexicographically. The record with the higher tuple wins, regardless of the order in which updates arrive.
-
-This allows replicas to converge without coordinating every write.
-
-LWW is a conflict-resolution policy, not a guarantee that concurrent writes are preserved. If two coordinators write different values to the same key, only the record with the higher version survives.
-
-### 6.2 Hybrid Logical Clock (HLC)
-
-Each coordinator maintains a local `HybridClock` to generate versions for writes.
-
-A Hybrid Logical Clock combines:
-
-- A physical timestamp derived from the local wall clock.
-- A logical counter that advances when multiple events occur at the same physical time or when a remote timestamp must be incorporated.
-
-The implementation packs these components into a single integer.
-
-The timestamp layout is:
-
-`hlc_timestamp = (physical_time_ms << 16) | logical_counter`
-
-The upper bits represent physical time in milliseconds. The lower 16 bits provide logical ordering within that physical millisecond.
-
-The helper function `hlc_ms()` extracts the physical millisecond component from an HLC timestamp.
-
-The node ID remains a separate component of the version tuple and is used as a deterministic tie-breaker.
-
-### 6.3 Generating Local Versions
-
-When a coordinator creates a new version, its HLC compares the current physical wall-clock time with its previous timestamp.
-
-Conceptually:
-
-`next_timestamp = max(current_wall_time, previous_timestamp + 1)`
-
-The implementation operates on the packed HLC integer, so the physical timestamp is shifted before comparison.
-
-This provides two important properties:
-
-1. Monotonicity: A coordinator's generated HLC timestamps do not move backwards, even if the physical clock has not advanced.
-2. Logical ordering: Multiple writes generated during the same physical millisecond receive strictly increasing timestamps.
-
-The node ID is attached to the timestamp to form the complete version:
+The complete LWW ordering uses:
 
 `(hlc_timestamp, node_id)`
 
-Versions from different coordinators can therefore be compared deterministically.
+The node ID provides a deterministic tie-breaker when two versions have the same HLC timestamp.
 
-### 6.4 Observing Remote Versions
+### 3.2 Versioning
 
-A node must incorporate versions it receives from other nodes so that future local writes do not unnecessarily fall behind observed updates.
+Every new write receives a version from the coordinator's Hybrid Logical Clock.
 
-When a replica receives a record through replication, it observes the record's HLC timestamp before applying the record.
+Replicas compare versions lexicographically and retain the newer record.
 
-The HLC also exchanges timestamps through membership gossip.
+This allows replicas to converge regardless of message arrival order.
 
-When a node receives a remote HLC timestamp:
+LWW does not preserve concurrent values. When two coordinators write different values concurrently, one version wins and the other is discarded.
 
-1. It compares the remote timestamp with its current local HLC.
-2. If the remote timestamp is not ahead, no clock advancement is necessary.
-3. If the remote timestamp is ahead but within the allowed drift limit, the local HLC advances to the observed timestamp.
-4. If the remote timestamp is too far ahead of the local physical clock, it is rejected and the clock-drift rejection counter increases.
+### 3.3 Tombstones
 
-Observing a remote timestamp does not mean that the receiving node has received every write from the remote node. It only incorporates the timestamp information.
+Deletion is represented by a versioned record with `value = None`.
 
-### 6.5 Clock-Skew Protection
+A tombstone is necessary because a replica may miss a deletion while unavailable. Without retained deletion metadata, that replica could later reintroduce an older value.
 
-The HLC uses the configured `max_clock_skew_ms` value to reject remote timestamps that are unreasonably far ahead of the receiver's wall clock.
+Tombstones therefore propagate through replication, handoff, repair and synchronization like ordinary records.
 
-The default configured limit is:
+### 3.4 TTL and Expiration
 
-`max_clock_skew_ms = 5000`
+TTL is represented using an absolute expiration deadline:
 
-A remote timestamp is rejected when its physical-time component is more than the configured drift allowance ahead of the local wall clock.
+`expire_at = current_wall_clock_ms + ttl_ms`
 
-This prevents a node with a severely incorrect clock from pushing the HLC of other nodes arbitrarily far into the future.
+The coordinator's command handler creates this deadline. Replication, read repair and rebalancing preserve the original timestamp.
 
-Rejected timestamps:
+A replica must never restart a relative TTL when receiving an existing record.
 
-- Do not advance the local HLC.
-- Increment the clock-drift rejection counter.
-- Generate a warning log, subject to rate limiting.
+After expiration, the value is no longer visible to reads. Its expiration metadata is retained during the tombstone grace period.
 
-A rejected HLC timestamp does not automatically reject the entire membership gossip exchange. Membership information can still be merged even when its accompanying clock timestamp is refused.
-
-The drift limit is a safety boundary, not a clock synchronization mechanism. It does not correct the physical clock of a node.
-
-### 6.6 HLC and Gossip
-
-Gossip messages include the sending node's latest HLC timestamp.
-
-During a gossip exchange:
-
-1. A node sends its membership information and latest HLC timestamp.
-2. The receiving node attempts to observe the sender's HLC timestamp.
-3. It merges the received membership information.
-4. It returns its own membership information and HLC timestamp.
-5. The initiating node observes the returned timestamp and merges the membership information.
-
-This allows idle nodes to learn about timestamps generated elsewhere in the cluster, even when they have not directly received the corresponding data record.
-
-Gossip therefore helps propagate logical clock progress independently of normal key replication.
-
-Gossip does not generate a new HLC timestamp merely because a round occurs. It exchanges each node's latest known timestamp.
-
-### 6.7 HLC Limitations
-
-HLC improves version ordering but does not eliminate every clock-related problem.
-
-- Physical time still matters: HLC uses the physical clock as the basis for new timestamps.
-- Large clock errors are rejected: A node with a clock outside the configured drift allowance may reject timestamps from another node.
-- No global chronological guarantee: HLC does not prove that every event is ordered according to real-world time across all nodes.
-- Concurrent writes are still discarded: LWW selects one winning version rather than preserving multiple concurrent values.
-- TTL still uses physical time: HLC version ordering does not make absolute expiration deadlines independent of clock accuracy.
-- Clock observation is not data synchronization: Learning a remote HLC timestamp does not mean the node has received all records associated with that timestamp.
-
-HLC provides better ordering than using independent wall-clock timestamps alone, but the system remains eventually consistent.
-
-### 6.8 VersionClock and HLC Evolution
-
-The initial versioning implementation used a local `VersionClock` based on wall-clock milliseconds and a node-ID tie-breaker.
-
-The HLC implementation extends this approach by incorporating logical progress and observing remote timestamps.
-
-The current version representation is:
-
-`(hlc_timestamp, node_id)`
-
-The original wall-clock-only versioning description is therefore no longer the current implementation.
-
-### 6.9 Tombstones
-
-A deletion is represented as a normal versioned record with `value = None`. This record is called a tombstone.
-
-Tombstones are necessary because replicas may be temporarily unavailable. Without a tombstone, a replica that missed a deletion could later return an older copy of the deleted value, effectively resurrecting the key.
-
-Tombstones therefore propagate deletion information through the cluster just like ordinary writes.
-
-### 6.10 Expiration and Tombstone Grace Period
-
-Expired records behave like tombstones. Once a record reaches its `expire_at` timestamp, it is no longer visible to reads, but its expiration metadata is retained temporarily.
-
-The record is eligible for garbage collection only after:
+The record becomes eligible for garbage collection only after:
 
 `expire_at + tombstone_grace_ms`
 
-This prevents a stale replica from restoring an expired value while other replicas still retain the deletion or expiration information.
+Expired values transferred during rebalancing are sent as bare tombstones so that expired data cannot become visible again.
 
-Grace-period invariant:
+## 4. Placement: Consistent Hashing and Range Ownership
 
-`tombstone_grace_ms > max_hint_ttl > expected_replica_downtime`
+### 4.1 Hash Ring
 
-The grace period must exceed the maximum hint lifetime and the expected replica downtime. A replica that remains offline longer than the grace period must be wiped and fully resynchronized before rejoining the cluster.
+The cluster uses consistent hashing to distribute keys.
 
-The configuration also accounts for clock-skew allowance. The configured tombstone grace period must be at least twice the configured maximum clock-skew allowance:
+Each physical node is represented by multiple virtual nodes (vnodes) on a circular hash space.
 
-`tombstone_grace_ms >= 2 * max_clock_skew_ms`
+A key is hashed to a position, and ownership starts at the next token clockwise.
 
-Longer grace periods improve protection against stale-data resurrection but increase memory usage because expired records remain stored until garbage collection.
+The implementation uses MD5 to generate deterministic 64-bit ring positions. MD5 is used as a non-security hash function.
 
-### 6.11 Non-Atomic Operations
+The configured vnode count is 150 per physical node.
 
-The following operations use a read-then-write sequence and are not atomic in the leaderless cluster:
+### 4.2 Vnode Count and Distribution
 
-- `SET NX`: Checks that a key does not exist before writing.
-- `SET XX`: Checks that a key exists before writing.
-- `EXPIRE` / `PEXPIRE`: Reads the existing value before writing an updated expiration timestamp.
-- `PERSIST`: Reads the existing value before writing a version without expiration.
+The vnode count was selected using a distribution benchmark.
 
-Concurrent coordinators can interleave these operations, so their conditions are best-effort rather than strongly consistent.
+For the measured configuration of 10 nodes, 100,000 keys and 150 vnodes per node:
 
-## 7. Consistent Hashing
+| Measurement | Result |
+|---|---:|
+| Coefficient of variation | ~9.4% |
+| Maximum-to-mean ownership ratio | ~1.14 |
+| Ring build time | ~9.3 ms |
+| Average lookup time | ~1.48 μs |
+| Key movement when adding node 11 | ~8.8% |
+| Theoretical movement | ~9.1% |
 
-### 7.1 Hash Ring
+These are measurements from the tested environment, not universal performance guarantees.
 
-The cluster uses consistent hashing to distribute keys across nodes.
+### 4.3 Token Naming and Node Identity
 
-Each physical node is represented by multiple virtual nodes (vnodes) on a hash ring. A key is hashed to a position on the ring and assigned to the next node clockwise.
-
-The implementation uses MD5 to generate deterministic 64-bit ring positions. MD5 is used as a non-security hash function, not for cryptographic protection.
-
-Each physical node receives 150 virtual nodes.
-
-Virtual nodes help distribute ownership more evenly than assigning one token per physical node.
-
-### 7.2 Vnode Count and Distribution
-
-The vnode count was selected using a distribution benchmark rather than an arbitrary default.
-
-The benchmark evaluated ownership distribution across multiple nodes and key counts.
-
-For the measured configuration of 10 nodes, 100,000 keys, and 150 vnodes per node:
-
-- Coefficient of variation: approximately 9.4%.
-- Maximum-to-mean ownership ratio: approximately 1.14.
-- Ring build time: approximately 9.3 ms.
-- Average lookup time: approximately 1.48 μs.
-
-The measured key movement when increasing the cluster from 10 to 11 nodes was approximately 8.8%, close to the theoretical expectation of approximately 9.1%.
-
-These are measurements from the tested environment, not performance guarantees for every machine or cluster configuration.
-
-### 7.3 Token Naming and Node Identity
-
-Token names use the format:
+Virtual token names use:
 
 `{node_id}#{i}`
 
-For example:
+Examples:
 
 - `n1#0`
 - `n1#1`
 - `n2#0`
 
-Node IDs must be stable and unique across restarts. If a node restarts with a new ID, it owns different ranges and the ring reshuffles.
+Node IDs must be stable and unique across restarts.
 
-Use stable IDs such as `n1` and `n2`, never random UUIDs per boot.
+A restarted node must reuse its original ID. A new ID represents a different ring member and causes ownership to change.
 
-### 7.4 Ring Rebuilding and Lookup Complexity
+### 4.4 Ring Operations and Complexity
 
-The ring's `_rebuild` operation has complexity:
+Let `V` represent the total number of virtual nodes.
 
-`O(V log V)`
+- Ring rebuilding: `O(V log V)`.
+- Key lookup using binary search: `O(log V)`.
 
-where `V` is the total number of virtual nodes.
+The ring is rebuilt when ring-eligible membership changes, not for every client request.
 
-Rebuilding happens when the set of ring-eligible membership entries changes, not on every request.
-
-Ring lookups use binary search and have complexity:
-
-`O(log V)`
-
-This keeps key ownership lookup efficient as the number of virtual nodes grows.
-
-### 7.5 Preference Lists
+### 4.5 Preference List
 
 A key's preference list contains distinct physical nodes in clockwise ring order.
 
-Because a physical node owns multiple virtual nodes, the ring may encounter several tokens belonging to the same node. The preference-list calculation skips duplicate physical node IDs.
+Because a physical node owns multiple virtual tokens, the lookup skips duplicate node IDs.
 
-This ensures that the configured replication factor represents copies on distinct physical nodes rather than multiple virtual tokens belonging to the same machine.
+This ensures that a replication factor of three means three distinct physical nodes rather than three virtual tokens belonging to fewer machines.
 
-### 7.6 Membership and Ring Ownership
+The first node in the preference list is the primary owner.
 
-Membership liveness and ring ownership are separate concerns.
+### 4.6 Ring Walk
 
-A node becoming `SUSPECT` or `DEAD` does not remove it from the consistent-hashing ring. The ring preserves its ownership position, while routing and replica selection skip unavailable nodes and continue to eligible nodes.
+The ring walk continues clockwise beyond the preference list and yields each physical node at most once.
 
-Keeping temporarily failed nodes in the ring prevents transient failures or flapping nodes from repeatedly rebuilding the ring and reshuffling key ownership.
+It is used to:
 
-A returning node with the same stable node ID retains its original ring position.
+- Find healthy stand-ins for unavailable replicas.
+- Find alternative sources during synchronization.
+- Identify additional nodes during ownership transitions.
 
-Permanent removal is an explicit membership and rebalancing operation. A node that completes graceful departure reaches `LEFT` and is excluded from the active ring.
+### 4.7 Range Diff
 
-The ring therefore changes because of explicit join, leave, or forget operations—not merely because a node's liveness changes.
+The ring-diff implementation compares ownership between two ring configurations.
 
-## 8. Membership and Failure Detection
+Instead of checking every key individually, it calculates contiguous hash ranges where the preference lists differ.
 
-### 8.1 Membership Table
+Each range records:
 
-Each node maintains a local membership table containing the nodes it knows about.
+- Its lower and upper hash boundaries.
+- The old preference list.
+- The new preference list.
+- Nodes that gained ownership.
+- Nodes that lost ownership.
 
-The membership table is a pure data structure with no networking or I/O dependencies. Its operations are deterministic and independently testable using a fake clock.
+The ranges are sorted, disjoint and bounded by the hash-space limits.
 
-Each membership entry contains:
+This allows rebalancing to transfer only data affected by an ownership change.
+
+### 4.8 Membership and Ring Separation
+
+A node becoming `SUSPECT` or `DEAD` does not automatically change ring ownership.
+
+Unavailable nodes are skipped during routing, but their ring positions remain intact.
+
+This prevents temporary failures and node flapping from repeatedly reshuffling keys.
+
+A newly discovered node enters the ring through membership discovery. A node reaching `LEFT` is excluded from the active ring.
+
+## 5. Membership and Failure Detection
+
+### 5.1 Membership Table
+
+Each node maintains its own membership table.
+
+An entry contains:
 
 `(node_id, host, port, rpc_port, state, incarnation)`
 
-- `node_id`: Stable and unique identifier for the node.
-- `host`: Advertised address used by other nodes to reach it.
-- `port`: Client-facing RESP port.
-- `rpc_port`: Internal node-to-node communication port.
-- `state`: Current membership state.
-- `incarnation`: Version number identifying the node's current membership generation.
+Node IDs are stable across restarts.
 
-Node IDs must remain stable and unique across restarts. Changing a node ID makes it a different ring member and changes key ownership.
+Membership is maintained independently by every node and exchanged through gossip.
 
-### 8.2 Membership States
-
-Nodes can have six membership states:
+### 5.2 Membership States
 
 | State | Rank | Meaning |
 |---|---:|---|
-| `JOINING` | 0 | A newly discovered node that has not completed cluster activation and data synchronization. |
-| `ALIVE` | 1 | A node currently considered healthy and available. |
-| `SUSPECT` | 2 | A node that has failed direct and indirect probing and may be unavailable. |
-| `LEAVING` | 3 | A node preparing to leave the cluster and hand off its data. |
-| `DEAD` | 4 | A node declared unavailable after its suspicion timeout expires. |
-| `LEFT` | 5 | A node that has completed graceful departure or has been explicitly forgotten. It is excluded from the active ring. |
+| `JOINING` | 0 | Discovered node undergoing activation and synchronization |
+| `ALIVE` | 1 | Healthy and available node |
+| `SUSPECT` | 2 | Node suspected of being unavailable |
+| `LEAVING` | 3 | Node performing graceful departure |
+| `DEAD` | 4 | Node declared unavailable |
+| `LEFT` | 5 | Node that has completed departure or been explicitly forgotten |
 
-The state precedence order is:
+State precedence:
 
 `JOINING < ALIVE < SUSPECT < LEAVING < DEAD < LEFT`
 
-The rank is used when resolving membership updates with equal incarnation numbers.
+`LEFT` is terminal for the membership entry. A stale update must not accidentally bring a deliberately removed node back into the ring.
 
-`LEFT` is terminal for that membership entry. A stale `ALIVE`, `SUSPECT`, or `DEAD` update must not bring a deliberately removed node back into the ring.
+### 5.3 Membership Merge Order
 
-A node that has crashed unexpectedly is detected through `SUSPECT` and `DEAD`. A node that has completed a graceful departure is represented by `LEFT`.
-
-### 8.3 Membership Merge Rules and Precedence
-
-Membership updates are merged using incarnation numbers and state rank.
-
-A remote entry supersedes the local entry if:
-
-1. Its incarnation number is higher than the local entry's incarnation; or
-2. Both entries have the same incarnation, but the remote entry has a higher-ranked state.
-
-The winning entry is therefore the maximum under the ordering:
+Membership entries are merged using:
 
 `(incarnation, state_rank)`
 
-For example:
+The entry with the higher incarnation wins. If incarnations are equal, the higher-ranked state wins.
 
-| Local entry | Incoming entry | Winner |
+Examples:
+
+| Local entry | Remote entry | Winner |
 |---|---|---|
-| `(10, ALIVE)` | `(11, SUSPECT)` | `(11, SUSPECT)` |
-| `(10, ALIVE)` | `(10, SUSPECT)` | `(10, SUSPECT)` |
-| `(10, DEAD)` | `(11, ALIVE)` | `(11, ALIVE)` |
-| `(10, SUSPECT)` | `(10, ALIVE)` | `(10, SUSPECT)` |
-| `(10, DEAD)` | `(10, ALIVE)` | `(10, DEAD)` |
-| `(10, DEAD)` | `(10, LEFT)` | `(10, LEFT)` |
+| `(10, ALIVE)` | `(11, SUSPECT)` | Remote |
+| `(10, ALIVE)` | `(10, SUSPECT)` | Remote |
+| `(10, DEAD)` | `(11, ALIVE)` | Remote |
+| `(10, DEAD)` | `(10, ALIVE)` | Local |
+| `(10, DEAD)` | `(10, LEFT)` | Remote |
 
-This makes the merge operation commutative, associative, and idempotent under the membership ordering, assuming endpoint metadata is consistent.
+The merge operation is deterministic, commutative, associative and idempotent under this ordering.
 
-Node endpoint metadata (`host`, `port`, and `rpc_port`) is treated as immutable for a given node ID. Conflicting endpoint metadata for an existing node ID is rejected rather than silently merged.
+### 5.4 Incarnation and Refutation
 
-`LEFT` is a deliberate terminal membership state. A normal self-refutation must not override it. Reintroducing a deliberately removed node requires an explicit administrative or new-join operation rather than ordinary gossip.
+Incarnation identifies a node's membership generation.
 
-### 8.4 Incarnation Numbers and Self-Refutation
+When a node receives a suspicion about itself, it refutes the accusation by increasing its own incarnation and advertising its `ALIVE` state.
 
-Each node initializes its incarnation number using its boot-time Unix timestamp in milliseconds.
+A higher incarnation takes precedence over stale accusations.
 
-Incarnation numbers distinguish different generations of a node and allow a restarted node to supersede stale membership information from its previous lifetime.
+Incarnations are initialized using the boot-time Unix timestamp in milliseconds. They are not persisted across restarts.
 
-When a node receives a `SUSPECT` or `DEAD` claim about itself with an incarnation greater than or equal to its current incarnation, it refutes the accusation by:
+A node speaks for itself: remote claims about its own membership entry cannot overwrite its local entry. Only its own refutation can advance that entry.
 
-1. Setting its incarnation to the claimed incarnation plus one.
-2. Setting its state to `ALIVE`, unless it is still `JOINING`.
-3. Disseminating the updated membership entry through gossip.
+This prevents another node from permanently declaring a healthy node dead through a stale gossip update.
 
-The higher incarnation ensures that the refutation supersedes the older accusation across the cluster.
+### 5.5 SWIM-Style Failure Detection
 
-The node itself is the authority on its own membership state. Remote membership updates about the local node are never directly adopted; they are processed through the refutation mechanism.
-
-A `LEFT` entry is different from an ordinary failure accusation and is not refuted through this mechanism.
-
-Restart assumption: Boot-time incarnation numbers assume the wall clock does not move backwards across restarts. A manual clock rewind or a restart after an incarnation has been increased substantially through refutation can cause a new incarnation to be lower than an older one. Incarnation persistence is not implemented in the current design.
-
-### 8.5 Failure Detection: SWIM-Style Probing
-
-Failure detection uses periodic direct and indirect probing rather than relying on heartbeat counters.
-
-Each node periodically selects another known node and sends a direct liveness probe through the internal RPC interface.
-
-The probing process is:
-
-1. The probing node sends a direct `ping` to the target.
-2. If the target does not respond within `probe_timeout_ms`, the probing node selects helper nodes.
-3. The helpers attempt indirect probes using `ping_req`.
-4. Each helper attempts to ping the target on behalf of the original probing node.
-5. If any helper succeeds, the target remains `ALIVE`. The original direct network path may have failed, but the target is reachable.
-6. If all direct and indirect probes fail, the target is marked `SUSPECT`.
-7. A local suspicion timer starts. If it expires without a successful refutation or newer membership update, the target is marked `DEAD`.
-
-The default configuration uses two indirect probes.
-
-Indirect probes happen before declaring `SUSPECT`, reducing false suspicions caused by a failed network path between two particular nodes.
-
-### 8.6 Suspicion Timers
-
-Suspicion timers are local to each node and are never included in gossip messages.
-
-Each node starts its own monotonic-clock timer when it first accepts a new `SUSPECT` entry. Repeated gossip of the same suspicion does not restart the timer.
-
-When the timer expires, the node creates a `DEAD` entry using the suspected node's existing incarnation number.
-
-Every node that independently expires the same suspicion therefore derives the same `(incarnation, DEAD)` membership entry.
-
-Nodes may temporarily disagree about when a target becomes `DEAD` because they may learn about the suspicion at different times. Once a `DEAD` entry is propagated, the membership merge rules ensure that it supersedes the corresponding `SUSPECT` entry.
-
-A newer `ALIVE` entry with a higher incarnation cancels the local suspicion timer.
-
-### 8.7 Protocol Timeline
-
-The following timeline describes the normal failure-detection and recovery protocol.
-
-Normal probing and failure detection:
-
-```text
-Probing node                 Target node                 Helper node
-     |                            |                           |
-     |---------- ping ----------->|                           |
-     |                            |                           |
-     |<--------- timeout ---------|                           |
-     |                                                        |
-     |---------------- ping_req(target) --------------------->|
-     |                                                        |
-     |                            |<---------- ping ----------|
-     |                            |                           |
-     |                            |---------- pong ---------->|
-     |<---------------------- success ------------------------|
-     |                                                        |
-     | Target remains ALIVE if an indirect probe succeeds.    |
-```
-
-If both direct and indirect probing fail:
-
-```text
-Direct ping fails
-      |
-      v
-Indirect probes fail
-      |
-      v
-Target becomes SUSPECT
-      |
-      +------------------------------+
-      |                              |
-      v                              v
-Target refutes accusation     Suspicion timeout expires
-      |                              |
-      v                              v
-Incarnation increases        Target becomes DEAD
-      |                              |
-      v                              v
-ALIVE entry is gossiped      DEAD entry is gossiped
-      |                              |
-      v                              v
-Other nodes converge         Other nodes converge
-on newer ALIVE state         on DEAD state
-```
-
-A successful self-refutation uses a higher incarnation number, so the new `ALIVE` entry supersedes the older `SUSPECT` or `DEAD` entry.
-
-### 8.8 Gossip and Membership Dissemination
-
-Nodes exchange membership information using periodic full-table push-pull gossip.
-
-During a gossip exchange:
-
-1. A node sends its complete membership table to a peer.
-2. The receiving node merges the incoming entries.
-3. The receiving node returns its membership table after merging.
-4. The initiating node merges the returned entries.
-
-This allows both nodes to learn membership updates from one another during the same exchange.
-
-The default gossip interval is 1000 milliseconds, with a configurable fanout of two peers per gossip round.
-
-Full-table gossip is intentionally simple and appropriate for the expected small cluster size. Each membership entry is approximately 100 bytes, making the approach practical for clusters of roughly 50 nodes.
-
-This approach does not scale efficiently to large clusters because the amount of information exchanged increases with membership table size. Production SWIM implementations typically use bounded dissemination of recent membership updates instead of transmitting the entire table.
-
-Gossip also exchanges the latest HLC timestamp, allowing nodes to incorporate remote logical clock progress independently of record replication.
-
-### 8.9 Bootstrap and Dynamic Node Discovery
-
-A node can start with a static membership configuration or use seed addresses to discover an existing cluster.
-
-- Static bootstrap: Configured members are initially added to the local membership table as `ALIVE` entries with incarnation zero. The local node starts with its own boot-time incarnation.
-- Seed-based bootstrap: A node with no static member list but configured seed addresses starts in `JOINING` state and contacts seed nodes through the internal RPC interface to discover existing membership information.
-- Activation: A `JOINING` node transitions to `ALIVE` when cluster activation and required synchronization complete, or when the configured join wait limit is reached with incomplete synchronization. The latter case is an availability trade-off described in Section 10.
-
-Seeds are initial discovery contacts, not permanent coordinators. Membership is subsequently learned and maintained through gossip.
-
-### 8.10 Membership Versus Consistent Hashing
-
-Membership and consistent-hashing ring ownership are separate concerns.
-
-A node becoming `DEAD` does not remove it from the consistent-hashing ring. Membership records its liveness, while the ring preserves its ownership position.
-
-Routing and replica selection skip unavailable nodes and continue to eligible nodes when selecting replicas.
-
-Keeping `DEAD` nodes in the ring prevents temporary failures or flapping nodes from repeatedly rebuilding the ring and reshuffling key ownership.
-
-A node that completes graceful departure becomes `LEFT` and is removed from the active ring. This is an explicit ownership change, not a consequence of ordinary liveness detection.
-
-### 8.11 Dynamic Join and Data Migration
-
-A newly discovered node is added to the membership table and consistent-hashing ring when it joins the cluster.
-
-However, historical keys belonging to the new node's ownership ranges must be transferred before the node can be treated as fully synchronized.
-
-The Phase 6 rebalancer implements this transfer. During the join, the node remains `JOINING`. It can participate in write paths so that writes are not lost while ownership is changing, but it is demoted in read preference until its synchronization is complete.
-
-If synchronization does not finish within `join_max_wait_ms`, the node can become `ALIVE` with gaps. This preserves availability at the cost of temporarily incomplete historical data. The incomplete state is logged as an error and can be repaired through read repair and `CLUSTER SYNC`.
-
-### 8.12 Graceful Shutdown
-
-A normal process stop is detected through the existing failure-detection mechanism.
-
-A graceful departure uses the explicit `LEAVING` state and Phase 6 handoff protocol. The leaving node transfers its records to the future owners before becoming `LEFT`.
-
-If a graceful leave cannot complete, the node can revert to `ALIVE` with a newer incarnation so that peers stop treating it as a continuing departure.
-
-### 8.13 Expected Failure Detection Time
-
-With the default configuration:
-
-- Probe interval: 1000 ms.
-- Direct probe timeout: 500 ms.
-- Indirect probes: 2.
-- Suspicion timeout: 5000 ms.
-
-A failed node should be selected for probing by some surviving node within approximately one probe interval.
-
-After direct and indirect probes fail, the node becomes `SUSPECT`, typically within approximately 1–2 seconds of failure under normal scheduling and network conditions.
-
-The suspicion timer then allows approximately another 5 seconds for refutation before the node becomes `DEAD`.
-
-The expected total failure detection time is approximately 6–8 seconds, targeting detection within 10 seconds under normal conditions. This is an operational target, not a hard upper-bound guarantee.
-
-### 8.14 Seven Phase 4 Design Decisions
-
-The following decisions define the scope and behavior of membership and failure detection in Phase 4.
-
-Decision 1 — SWIM-style direct and indirect probing
-
-A node first attempts a direct ping. If it fails, the node asks two helper nodes to probe the target indirectly. Only when all attempts fail does the target become `SUSPECT`. The target becomes `DEAD` only after its suspicion timeout expires.
-
-Decision 2 — Membership liveness is separate from ring ownership
-
-`DEAD` nodes remain in the consistent-hashing ring. Routing skips dead nodes, but their ownership positions are preserved. Temporary failures and recovery therefore do not repeatedly reshuffle the ring. Permanent removal is an explicit Phase 6 operation.
-
-Decision 3 — Boot-time incarnation numbers
-
-A node initializes its incarnation using the boot-time Unix timestamp in milliseconds. A node can refute a suspicion by increasing its incarnation beyond the accusation. Restart assumes the wall clock has not moved backwards. Incarnation persistence is deferred.
-
-Decision 4 — Full-table push-pull gossip
-
-Nodes exchange their complete membership tables during gossip. This is simple and appropriate for the expected cluster size of approximately 50 nodes. Bounded dissemination is a possible future improvement for larger clusters.
-
-Decision 5 — Dynamic join with historical data migration deferred
-
-A joining node is added to membership and the ring, but historical keys are not moved automatically in Phase 4. Reads for affected keys may temporarily miss data until Phase 6 implements synchronization.
-
-Decision 6 — Shutdown and graceful departure are separate
-
-An ordinary `stop()` does not announce graceful departure. Other nodes detect the stopped process through normal failure detection. The `LEAVING` state is used by the Phase 6 graceful departure protocol.
-
-Decision 7 — Failure detection timing target
-
-With a 1000 ms probe interval and a 5000 ms suspicion timeout, the expected failure detection time is approximately 6–8 seconds. The target is under 10 seconds under normal conditions, not a hard guarantee.
-
-### 8.15 Known Limits
-
-The current membership and failure-detection implementation has the following limitations:
-
-- Small-cluster gossip: Full-table gossip is intended for clusters of roughly 50 nodes. It is not optimized for large-scale membership dissemination.
-- Wall-clock restart assumption: A restarted node relies on the wall clock not having moved backwards. Incarnation persistence is not implemented.
-- Eventual membership convergence: Nodes may temporarily maintain different views of cluster state.
-- Local suspicion timers: Timers can expire at different times because nodes may learn about suspicions at different times.
-- Imperfect failure detection: The system cannot perfectly distinguish a crashed node from a slow or temporarily unreachable node.
-- In-memory state: Membership and data are not backed by durable storage.
-
-## 9. Survival and Recovery
-
-Phase 4 extends the cache from basic replication and failure detection to handling writes and reads while nodes are unavailable.
-
-The main mechanisms are:
-
-- Hedged reads to reduce the effect of slow replicas.
-- Read fanout to compare multiple replica responses.
-- Sloppy quorum to allow writes to use healthy stand-in nodes.
-- Hinted handoff to retain writes intended for unavailable replicas.
-- Read repair to correct stale or missing replicas.
-- Hint expiration and tombstone grace-period coordination to reduce stale-data resurrection.
-
-These mechanisms improve availability and recovery, but do not provide disk durability or eliminate every consistency gap.
-
-### 9.1 Hedged Reads
-
-A read can be delayed by a slow or unresponsive replica even when other replicas are healthy.
-
-Hedged reads reduce this delay by issuing another request when the first replica has not responded within the configured `hedge_ms` interval.
-
-The default hedge delay is 50 ms.
+Failure detection uses direct and indirect probing.
 
 The process is:
 
-1. The coordinator selects replicas in its read order.
-2. It sends a read request to the first replica.
-3. If that request remains pending beyond `hedge_ms`, the coordinator sends another request to the next replica while the original request is still pending.
-4. The coordinator can therefore make progress using another replica without waiting indefinitely for the slow request.
-5. Outstanding requests are cancelled or cleaned up when they are no longer needed.
+1. A node selects a peer and sends a direct ping.
+2. If the direct probe fails, it asks two helper nodes to probe the target indirectly.
+3. If all attempts fail, the target becomes `SUSPECT`.
+4. The target has an opportunity to refute the suspicion by increasing its incarnation.
+5. If the suspicion timeout expires without refutation, the target becomes `DEAD`.
+6. Membership changes propagate through gossip.
 
-Hedging is a latency optimization. It does not itself guarantee that the returned value is the newest version.
+A node is not immediately declared dead after a single failed network request.
 
-### 9.2 Read Fanout and Version Selection
+### 5.6 Gossip
 
-The `read_fanout` setting controls how many replica responses the coordinator consults for a read. Its default value is 2.
+Nodes exchange their membership tables using full-table push-pull gossip.
 
-When multiple replica records are collected, the coordinator compares their versions and selects the newest record using the LWW ordering:
+Gossip also exchanges the latest known HLC timestamp.
+
+This allows membership changes and logical-clock progress to propagate between nodes.
+
+Full-table gossip is intentionally simple and suitable for small clusters. It is not designed for very large membership sets.
+
+### 5.7 Failure Detection Timings
+
+The configured timing targets are:
+
+| Parameter | Value |
+|---|---:|
+| Probe interval | 1,000 ms |
+| Suspicion timeout | 5,000 ms |
+| Indirect probe helpers | 2 |
+| Expected detection time | ~6–8 seconds |
+| Operational target | Under 10 seconds |
+
+These values are targets under normal conditions, not hard upper bounds.
+
+Network delay, scheduling and gossip propagation can affect the actual detection time.
+
+A normal process stop does not automatically announce graceful departure. Other nodes detect it through failure detection. Graceful departure uses `LEAVING` and `LEFT`.
+
+## 6. Replication: Write Path, Read Path and Recovery
+
+### 6.1 Replication Factor
+
+Each key has a preference list of up to `N` distinct physical nodes.
+
+The default project configuration uses three replicas.
+
+Any node can coordinate a write or read for a key.
+
+### 6.2 Write Path
+
+1. The coordinator calculates the preference list.
+2. It generates an HLC version.
+3. It creates the record and its expiration deadline, if applicable.
+4. It sends the record to preference-list replicas.
+5. Each replica observes the incoming HLC timestamp and applies the record if its version is newer.
+6. The coordinator collects acknowledgements.
+7. The request succeeds or fails according to the configured write acknowledgement requirement.
+
+The coordinator is not a permanent primary. It only coordinates that individual request.
+
+### 6.3 Last-Write-Wins
+
+Replicas compare:
 
 `(hlc_timestamp, node_id)`
 
-This allows a read to prefer a newer version when replicas temporarily disagree.
+The higher version wins.
 
-Hedging and read fanout serve related but different purposes:
+This makes record application idempotent with respect to receiving the same version repeatedly and allows replicas to converge through replication and repair.
 
-- Hedging controls when additional replica requests are issued to avoid waiting on a slow replica.
-- Read fanout controls how many replica responses are consulted.
-- LWW version comparison determines which record is considered newest among the records collected.
+Concurrent writes are not merged. LWW chooses one winner.
 
-A read that only receives one successful response cannot compare that record against replicas it did not successfully consult.
+### 6.4 Read Path
 
-### 9.3 Read Repair
+The coordinator obtains the key's preference list and consults replicas according to `read_fanout`.
 
-Read repair uses the records collected during a read to identify stale or missing replicas.
+The default read fanout is two.
 
-The coordinator selects the newest version among the available records. If another consulted replica has an older or missing record, the coordinator sends the newer record to that replica.
+When multiple responses arrive, the coordinator selects the newest version using LWW ordering.
 
-This allows frequently accessed keys to converge without requiring a separate full-dataset scan for every read.
+A read that receives only one successful response cannot compare it against replicas it did not consult.
 
-Read repair is opportunistic:
+### 6.5 Hedged Reads
 
-- It can repair keys that are read.
-- It cannot guarantee recovery of keys that are never accessed.
-- It does not replace full anti-entropy synchronization.
-- It cannot restore data that has been lost everywhere.
+A slow replica can delay a read even when another replica is healthy.
 
-Read repair is restricted to the relevant preference-list replicas. During a join, it does not treat every temporary read candidate as a permanent owner.
+Hedging sends another replica request when the first request remains pending beyond `hedge_ms`.
 
-Historical catch-up synchronization for restarted nodes is handled by Phase 6.
+The default hedge delay is 50 ms.
 
-### 9.4 Sloppy Quorum and Stand-in Nodes
+Hedging reduces waiting time by allowing another replica to respond without waiting indefinitely for the first.
 
-Strict replication attempts to write to the nodes in a key's preference list.
+Hedging is a latency optimization, not a guarantee that the returned value is globally newest.
 
-However, a preference-list owner may be unavailable before failure detection has marked it `DEAD`. Waiting for the failure detector would unnecessarily delay or reject writes.
+### 6.6 Read Repair
 
-Sloppy quorum allows a write slot to be assigned to another healthy node when its intended owner is unavailable.
+When a read discovers that a consulted replica has an older or missing record, the coordinator schedules repair using the newest record it found.
 
-The process is:
+Read repair:
 
-1. The coordinator obtains the key's preference list from the consistent-hashing ring.
-2. It attempts to write the record to each preference-list owner.
-3. If an owner is already known to be `DEAD`, the coordinator skips the direct write attempt.
-4. If a direct write fails, the coordinator searches clockwise beyond the preference list for a healthy stand-in.
-5. The stand-in stores a hint identifying the intended owner and the record that must eventually be delivered to that owner.
-6. A successfully stored hint can count toward the write acknowledgement requirement.
+- Updates stale replicas.
+- Restores missing records on consulted replicas.
+- Helps frequently accessed keys converge.
 
-Stand-ins are selected by walking the ring beyond the original preference list. A shared iterator prevents concurrent failed write slots from selecting the same stand-in during the same replication operation.
+Read repair is demand-driven. It cannot guarantee recovery of keys that are never read and does not replace full historical synchronization.
 
-This also covers the detection window: a node can be unreachable even though membership still reports it as `ALIVE`.
+Repair targets the relevant preference-list nodes, not arbitrary temporary read candidates.
 
-### 9.5 Hinted Handoff
+### 6.7 Sloppy Quorum
 
-A hint represents a record that should eventually be delivered to an unavailable preference-list owner.
+A preference-list replica may be unreachable before failure detection marks it `DEAD`.
 
-A hint contains:
+Sloppy quorum allows a healthy stand-in node to accept the write on behalf of the unavailable owner.
 
-- The intended owner node ID.
-- The key.
-- The versioned record to be delivered.
+The coordinator:
 
-The stand-in retains the hint until it can be replayed or until the hint expires.
+1. Attempts the intended preference-list replicas.
+2. Skips known-dead nodes.
+3. If a direct write fails, walks clockwise beyond the preference list.
+4. Selects a healthy stand-in.
+5. Stores a hint containing the intended owner and record.
+6. Counts the stored hint toward the configured write acknowledgement requirement in eventual mode.
 
-When the intended owner becomes available again, the stand-in sends the hinted record to that owner. The owner applies the record using the normal version comparison rules, so an older hinted record does not overwrite a newer local version.
+A shared iterator prevents concurrent failed write slots from selecting the same stand-in during one replication operation.
 
-Hint replay is therefore a temporary recovery mechanism for writes made while an owner is unavailable.
+Sloppy quorum improves availability but can temporarily make a write invisible to a read that consults only the original preference list.
 
-Hints are stored in memory in the current implementation. They are not durable.
+### 6.8 Hinted Handoff
 
-### 9.6 Hint Capacity and Expiration
+A hint represents a record that must eventually reach an unavailable preference-list owner.
 
-The hint store has a configured capacity and a hint time-to-live.
+It contains:
 
-When the hint store reaches its capacity:
+- Intended owner ID.
+- Key.
+- Versioned record.
 
-- New hints are rejected.
-- Existing hints are not silently evicted to make room.
-- A write slot that cannot store its hint does not receive an acknowledgement through that stand-in.
+When the intended owner returns, the stand-in replays the hint.
 
-This avoids silently discarding older recovery work in favor of newer hints.
+The owner applies the record using normal version comparison, so an older hint cannot overwrite a newer local version.
 
-The hint lifetime must be coordinated with tombstone retention.
+Hints are stored in memory and are not durable.
 
-Hint and tombstone invariant:
+The hint store is bounded. When full, new hints are rejected rather than silently evicting existing hints. A write cannot receive acknowledgement through a stand-in if the required hint cannot be stored.
+
+### 6.9 Hint Lifetime and Tombstone Safety
+
+The configuration must satisfy:
 
 `hint_ttl_ms <= tombstone_grace_ms`
 
-The tombstone grace period must be at least as long as the maximum hint lifetime. Otherwise, a tombstone could be garbage-collected while a hint capable of replaying an older value still exists.
+The tombstone grace period must also account for clock skew:
 
-The existing grace-period assumption also requires the grace period to account for expected replica downtime:
+`tombstone_grace_ms >= 2 * max_clock_skew_ms`
 
-`tombstone_grace_ms > max_hint_ttl > expected_replica_downtime`
+It must be long enough to protect against expected replica downtime.
 
-The deployment configuration must satisfy the intended relationship. This document describes the invariant; it does not claim that every configuration has already been validated against it.
+A replica returning after a downtime longer than the supported grace period must be wiped and fully resynchronized before rejoining as an owner.
 
-### 9.7 Read Repair and Hinted Handoff Work Together
+### 6.10 Recovery Mechanisms
 
-Hinted handoff and read repair address different recovery situations.
-
-| Mechanism | Main purpose | Recovery scope |
+| Mechanism | Purpose | Limitation |
 |---|---|---|
-| Hinted handoff | Deliver writes made while a preference-list owner was unavailable | Records for which a hint was retained |
-| Read repair | Correct stale or missing replicas discovered during reads | Keys that are read and whose replicas are consulted |
-| Phase 6 catch-up | Restore historical data to a restarted or newly joined node | Historical ownership ranges requiring synchronization |
+| Read failover | Read from another reachable replica | Cannot recover data absent from all reachable replicas |
+| Write failover | Use a healthy stand-in for an unavailable owner | Depends on stand-in availability and hint capacity |
+| Hinted handoff | Deliver writes made while an owner was unavailable | Hints are in-memory and can be lost |
+| Read repair | Repair stale or missing records discovered during reads | Only repairs keys that are read |
+| `CLUSTER SYNC` | Perform historical catch-up and restore ownership copies | Requires available source replicas |
 
-A node returning after downtime can receive writes that were hinted while it was unavailable.
+A restarted node loses its local records and hints. It must perform historical catch-up rather than being assumed fully synchronized simply because it has returned to `ALIVE`.
 
-However, hints do not necessarily contain every record that existed before the node went down. Read repair can restore some of those records when their keys are accessed, but it is not a complete historical data transfer.
+### 6.11 Client Retries
 
-### 9.8 Quorum Overlap and Consistency
+The client is configured with a bounded retry count.
 
-In strict quorum operation, read and write acknowledgement sets can overlap.
+A request can time out even after the server has processed it. Therefore, the client may not always know whether an operation committed.
 
-For a replication factor `N`, a write quorum `W`, and a read quorum `R`, the usual overlap condition is:
+Repeating ordinary `SET` or `DEL` operations can produce another version, but this does not provide general exactly-once execution.
 
-`R + W > N`
+Retrying a TTL-bearing write can also calculate a new expiration deadline.
 
-When the read and write quorums operate over the same preference set, this overlap ensures that a successful quorum read consults at least one replica that acknowledged the write.
+Conditional and read-modify-write operations require additional care because they are not atomic across the cluster.
 
-This is the basis for the intended quorum-read visibility guarantee in strict, non-sloppy cases.
+## 7. Rebalancing: Join, Leave and Cleanup
 
-However, sloppy quorum changes the acknowledgement set.
+Rebalancing moves historical records when ring ownership changes.
 
-A write acknowledged through a stand-in may have been stored outside the original preference list. A later read over the original preference list is not guaranteed to consult that stand-in.
+It supports:
 
-Therefore:
+- New node joins.
+- Restarted-node recovery.
+- Graceful departure.
+- Ownership cleanup.
+- Administrative removal followed by synchronization.
 
-- Strict quorum overlap applies when the read and write acknowledgement sets are drawn from the same preference set.
-- A sloppy-quorum acknowledgement through a stand-in does not automatically guarantee visibility to a later read over the original preference list.
-- Hint replay and read repair help close this temporary gap.
-- The system does not claim strong consistency for sloppy-quorum writes.
+### 7.1 Join: Pull-Based Synchronization
 
-### 9.9 Availability and the CAP Trade-off
+A joining node pulls the records belonging to its new ownership ranges from existing live replicas.
 
-Sloppy quorum and hinted handoff favor availability when a preference-list owner is unavailable.
+The process:
 
-A coordinator may acknowledge a write after a healthy stand-in has stored a hint, rather than requiring every intended owner to be directly reachable.
+1. The new node enters `JOINING`.
+2. Membership changes propagate through gossip.
+3. The node waits for `rebalance_settle_ms`, approximately three gossip rounds.
+4. The ownership transition is calculated using the old and new rings.
+5. The joiner identifies the ranges it needs.
+6. It selects a live source replica and requests records.
+7. Records are streamed in batches and applied using normal version comparison.
+8. If a source fails, the joiner tries another candidate.
+9. The joining node participates in writes so that new updates can reach it during historical transfer.
+10. It remains demoted in normal read preference until synchronization completes.
+11. When synchronization finishes, it becomes `ALIVE`.
 
-This improves write availability, but introduces a temporary consistency gap:
+During the transition, reads are widened to include the joining node and displaced old replicas.
 
-A write acknowledged through a stand-in may not be visible to a read that consults only the original preference-list replicas until the hint is replayed or the data is repaired.
+Read repair remains restricted to preference-list nodes.
 
-The system therefore favors availability over immediate consistency in this failure scenario.
+### 7.2 Settle Window
 
-This is an explicit design trade-off, not a claim that the cache provides both perfect availability and strong consistency during partitions.
+The configured `rebalance_settle_ms` gives membership gossip time to disseminate a new node's presence before ownership transitions are acted upon.
 
-### 9.10 Restarted Nodes and Recovery
+The intended delay is approximately three gossip rounds.
 
-A node that restarts loses its local in-memory records and in-memory hints.
-
-It rejoins membership using its stable node ID and its normal membership activation process. Its ring position remains associated with that stable ID.
-
-Recovery is limited to:
-
-1. Hint replay: Other nodes may deliver writes that were hinted while the node was unavailable.
-2. Read repair: Records can be restored when their keys are read and newer records are found on other replicas.
-3. Phase 6 catch-up: The restarted node pulls historical records from available replicas before serving as a fully synchronized owner.
-
-A restarted node must not be treated as fully synchronized merely because it has returned to `ALIVE`. The Phase 6 join process keeps it in `JOINING` while it performs catch-up, subject to the configured join wait limit.
-
-### 9.11 Client Retry Behavior
-
-Client retries can occur when a connection fails or a request times out, even if the server may already have processed the request.
-
-LWW versioning helps make repeated writes converge on a consistent record, but it does not provide a general exactly-once execution guarantee.
-
-For ordinary `SET` operations, retrying the same key and value creates another version containing the same value. The new version may have a later timestamp.
-
-For deletion, a repeated `DEL` produces another tombstone version.
-
-However, retries can have observable effects:
-
-- Repeating a `SET` with an expiration can calculate a new expiration deadline and extend the key's lifetime.
-- Repeating an operation creates a new version rather than reusing the original operation version.
-- `SET NX` and `SET XX` are read-then-write operations and are not atomic cluster-wide conditions.
-- Other conditional operations should not be treated as exactly-once or safely retryable without additional operation identifiers or atomic coordination.
-
-The client should therefore distinguish between an operation being safe to repeat at the value level and an operation being exactly-once.
-
-### 9.12 Failure-Mode Summary
-
-| Failure scenario | Expected behavior | Limitation |
-|---|---|---|
-| One replica fails before failure detection | Direct write may fail; a healthy stand-in can store a hint. Reads can use other reachable replicas. | The failure detector may still temporarily report the node as `ALIVE`. |
-| One replica is marked `DEAD` | The coordinator skips it and attempts a stand-in for its write slot. | A stand-in must be available and have hint capacity. |
-| Dead node returns | Membership can mark it `ALIVE`; retained hints can be replayed. Read repair can correct stale records discovered during reads. | The node may still be missing historical data. |
-| Stand-in fails before hint replay | Its in-memory hint may be lost. | Read repair can recover only keys that are subsequently read and have a newer surviving copy. |
-| No suitable stand-in exists | The coordinator cannot assign the failed write slot through hinted handoff. | The write fails if the required acknowledgement count cannot otherwise be met. |
-| Client-facing node fails | The client receives a connection error and may retry through another node. | The client cannot always know whether the original request was processed before the connection failed. |
-
-### 9.13 Phase 4 Design Decisions — Replication and Survival
-
-Decision 1 — Hint storage is introduced before hinted handoff
-
-Hint storage is introduced before replay because sloppy quorum cannot acknowledge a write through a stand-in unless there is somewhere to retain the record for the unavailable owner.
-
-Decision 2 — Hedged reads
-
-When a replica has not responded within `hedge_ms` (default 50 ms), the coordinator can ask another replica while the original request remains pending. This reduces the impact of slow replicas on read latency.
-
-Decision 3 — Read fanout and newest-version selection
-
-Reads consult `read_fanout` replicas (default 2) and use HLC-based LWW version comparison to select the newest collected record. Read repair uses the comparison to update stale or missing replicas.
-
-The strict quorum overlap condition `R + W > N` applies to acknowledgement sets drawn from the same preference set. Sloppy-quorum stand-ins are an exception to that simple overlap argument.
-
-Decision 4 — Stand-ins are found by walking beyond the preference list
-
-A failed or known-dead preference-list owner can be replaced by the next healthy node found by walking the ring clockwise beyond the preference list. This also covers the time between a node becoming unreachable and the failure detector declaring it `DEAD`.
-
-Decision 5 — Hints are in-memory only
-
-Hints are held in memory. If a stand-in fails before replay, its hints can be lost. Read repair and Phase 6 catch-up synchronization provide additional recovery mechanisms, but read repair only repairs keys that are accessed.
-
-Decision 6 — Hint capacity is bounded
-
-When the hint store is full, new hints are rejected instead of silently evicting existing hints. A write slot that cannot be assigned to a direct owner or a stand-in does not receive an acknowledgement.
-
-Decision 7 — Restarted nodes require historical catch-up
-
-A restarted node comes back without its previous in-memory records. Hints cover writes made while it was down, while read repair can restore older records for keys that are read. Complete historical catch-up is handled by Phase 6.
-
-### 9.14 Known Limits of Phase 4
-
-- Hints are in-memory and can be lost if their stand-in fails before replay.
-- A full hint store can prevent new hinted write slots from being acknowledged.
-- A sloppy-quorum write acknowledged through a stand-in may not be visible to a read over the original preference list until hint replay or repair.
-- Read repair is demand-driven and cannot restore keys that are never read.
-- A restarted node is not fully recovered until historical catch-up synchronization completes.
-- Hedged reads reduce waiting on slow replicas but do not independently guarantee the newest value.
-- LWW discards concurrent versions that lose the version comparison.
-- HLC reduces sensitivity to small clock differences but does not guarantee globally correct real-time ordering.
-- Client retries do not provide exactly-once execution.
-- `SET NX`, `SET XX`, `EXPIRE`, `PEXPIRE`, and `PERSIST` are not atomic cluster-wide operations.
-- There is no disk persistence, transaction support, authentication, or TLS.
-
-## 10. Rebalancing
-
-Phase 6 introduces explicit ownership changes and historical data movement. It handles three operations:
-
-1. A new node joining or a previously failed node restarting.
-2. An existing node gracefully leaving the cluster.
-3. Cleanup and removal of records from nodes that no longer own those records.
-
-The goal is to change ownership without unnecessarily interrupting client traffic or deleting the last available copy of a record.
-
-### 10.1 Phase 6 Design Decisions
-
-The following decisions define the rebalancing protocol.
-
-Decision 1 — Pull-based join
-
-A joining node pulls the records it needs from existing live replicas. It does not depend on a single permanent source. If a source fails during a pull, it tries the next candidate source.
-
-Decision 2 — Settle window
-
-The join process waits for a settle window of approximately three gossip rounds before treating the membership view as stable enough to calculate the ownership transition.
-
-The configured `rebalance_settle_ms` represents this delay.
-
-This relies on the assumption that no coordinator remains partitioned from gossip for longer than `rebalance_settle_ms`. The settle period reduces the chance of a coordinator continuing to use a stale membership view, but it is not a consensus protocol and cannot eliminate arbitrary network partitions.
-
-Decision 3 — Joining nodes participate in writes
-
-A `JOINING` node is included in write paths so that it can receive current updates while historical records are being transferred.
-
-It is demoted in read paths until synchronization is complete. This prevents clients from preferentially reading from a node whose historical dataset may still contain gaps.
-
-Decision 4 — Reads are widened during join
-
-During a join, read candidates are widened to include the joining node and the displaced old replica. This helps reads find records while ownership is transitioning.
-
-Read repair remains restricted to the key's preference-list nodes. Temporary read candidates are not automatically treated as permanent owners.
-
-Decision 5 — Double-writes during leave
-
-While a node is `LEAVING`, writes are sent both to the normal preference list and to the future owners in `ring_after`.
-
-These additional writes are best-effort and are not counted toward the configured write acknowledgement requirement `W`.
-
-This allows the future owners to receive newer versions while the leaving node is draining its existing records.
-
-Decision 6 — Confirmation before deletion
-
-An old owner must not delete a record merely because a transfer was attempted.
-
-Deletion requires confirmation from every relevant current owner that it holds a version at least as new as the old owner's version.
-
-If an owner is unreachable or cannot confirm possession of a sufficiently new version, the old record is retained and cleanup is retried.
-
-Decision 7 — `LEFT` is terminal
-
-A node that completes graceful departure becomes `LEFT`. `LEFT` ranks above `DEAD` and is excluded from the active ring.
-
-Ordinary liveness changes never rebuild the ring. Explicit join, graceful leave, and administrative forget operations change ring eligibility.
-
-Decision 8 — Forget does not automatically redistribute data
-
-`CLUSTER FORGET <id>` explicitly removes a permanently dead or leaving node from membership and the ring.
-
-It does not itself transfer or recreate all missing replicas. The operator must run `CLUSTER SYNC` on surviving nodes to restore the desired number of copies.
-
-Decision 9 — Expired values are transferred as bare tombstones
-
-An expired record is not transferred as an ordinary live value. It is shipped as a bare tombstone so that the expired value cannot become visible again on a new owner.
-
-Decision 10 — Stream sessions are in-memory
-
-Rebalancing stream sessions are held in memory. They are not durable across process restarts. A restarted joiner starts a fresh join and pulls the required data again.
-
-Decision 11 — Restarted nodes pull before serving
-
-A restarted node must perform catch-up before it is treated as a fully synchronized owner. It starts in `JOINING` and pulls its historical ownership ranges before normal read preference is restored.
-
-Decision 12 — Bounded join wait favors availability
-
-If synchronization cannot complete before `join_max_wait_ms`, the node is allowed to become `ALIVE` with incomplete data rather than remain unavailable indefinitely.
-
-The incomplete synchronization is logged as an error. Read repair and a later `CLUSTER SYNC` can repair missing records.
-
-This is an explicit availability trade-off, not a guarantee that the node is fully synchronized when it becomes `ALIVE`.
-
-### 10.2 Flow One — Join and Restart
-
-A new node or restarted node must obtain the records belonging to its ownership ranges before it becomes a normal read target.
-
-The join flow is:
-
-1. The node starts and is represented as `JOINING`.
-2. Membership information is exchanged through gossip.
-3. The node waits for the configured settle window, approximately three gossip rounds.
-4. The coordinator calculates the ownership changes between the current ring and the ring including the joining node.
-5. The joining node identifies the ranges it needs to receive.
-6. It selects a live existing replica as a source and requests the relevant records.
-7. Records are streamed in batches and applied using normal version comparison rules.
-8. If a source becomes unavailable during the pull, the joiner switches to the next candidate source for the affected ranges.
-9. Writes continue to include the joining node, so updates made during synchronization can reach it.
-10. Reads are widened to include the joining node and displaced old replicas, while the joining node remains demoted in normal read preference.
-11. When synchronization completes, the node transitions to `ALIVE`.
-12. If synchronization cannot complete within `join_max_wait_ms`, the node can transition to `ALIVE` with gaps. The incomplete synchronization is logged as an error.
-
-A restarted node follows the same catch-up process. Its stable node ID preserves its ring identity, but its in-memory records are not assumed to have survived the restart.
-
-Join invariant: A node must not be treated as a fully synchronized read owner merely because it has been discovered through gossip or inserted into the ring.
-
-### 10.3 Flow Two — Graceful Leave
-
-A graceful departure transfers records to the future owners before the departing node is removed from the ring.
-
-The leave flow is:
-
-1. The node receives `CLUSTER LEAVE`.
-2. It transitions to `LEAVING`.
-3. The rebalancer calculates the future ownership arrangement using `ring_after`, which excludes the leaving node.
-4. While it remains `LEAVING`, writes are double-written to the normal owners and the future owners.
-5. The additional writes to future owners are best-effort and do not count toward `W`.
-6. The leaving node scans its local records and identifies the future owners for each key.
-7. It transfers records to those owners.
-8. Future owners apply received records using normal version comparison.
-9. The leaving node completes the handoff and transitions to `LEFT`.
-10. `LEFT` is disseminated through membership gossip and the node is excluded from the active ring.
-
-If the handoff fails or times out, the node reverts to `ALIVE` with a bumped incarnation. This allows peers to distinguish the new active membership state from the previous leave attempt.
-
-A graceful leave must not be considered complete while required handoff work remains unresolved.
-
-Leave invariant: A node is not removed from the active ring until its graceful leave protocol completes and it reaches `LEFT`.
-
-### 10.4 Flow Three — Cleanup and Ownership Confirmation
-
-After a join or leave, some nodes may retain records that no longer belong to them.
-
-Cleanup removes these obsolete copies only after confirming that the current owners have sufficiently new versions.
-
-The cleanup flow is:
-
-1. The old owner scans records that are no longer in its ownership responsibility.
-2. It determines the current owners for each key.
-3. It checks whether every required current owner has a record with a version greater than or equal to the old owner's version.
-4. If all owners confirm, the old owner can safely remove its obsolete copy.
-5. If an owner is unreachable, missing the record, or has an older version, deletion is deferred.
-6. Cleanup retries after `cleanup_interval_ms`.
-
-This confirmation prevents the old owner from deleting the last available copy merely because a transfer was attempted.
-
-Expired records are handled specially. Expired values are transferred as bare tombstones rather than as live values.
-
-Cleanup invariant: An old owner may delete a record only after all required current owners confirm that they hold a version at least as new as the record being deleted.
-
-### 10.5 Rebalancing Invariants
-
-The rebalancing implementation relies on the following invariants.
-
-Invariant 1 — Liveness does not change ring ownership
-
-A node becoming `SUSPECT` or `DEAD` does not automatically change the consistent-hashing ring.
-
-The ring changes only through explicit ownership and membership operations such as join, graceful leave, and administrative forget.
-
-Invariant 2 — Deletion requires owner confirmation
-
-An old owner cannot delete a record simply because it has sent the record to another node.
-
-Every required current owner must confirm that it holds a version at least as new as the old owner's record. If confirmation is unavailable, the record remains stored.
-
-Invariant 3 — `JOINING` nodes participate in writes but are demoted in reads
-
-The joining node receives writes during its synchronization period so that updates are not missed while historical data is being transferred.
-
-It is demoted in read preference until synchronization completes. During the transition, reads are widened to include the joining node and the displaced old replica.
-
-Invariant 4 — `LEAVING` nodes are double-written
-
-While a node is `LEAVING`, writes are sent to both the normal preference list and future owners in `ring_after`.
-
-The extra future-owner writes are best-effort and do not count toward `W`.
-
-Invariant 5 — Read repair targets preference-list nodes
-
-Read repair is restricted to the key's preference-list nodes. A temporary read candidate does not automatically become a permanent repair target.
-
-Invariant 6 — `LEFT` is terminal
-
-A gracefully departed node is represented by `LEFT`, which ranks above `DEAD` and is excluded from the active ring.
-
-Invariant 7 — Expired values cannot be revived by transfer
-
-Expired records are shipped as bare tombstones. Rebalancing must not transfer an expired value as an ordinary live record.
-
-Invariant 8 — Synchronization sessions are not durable
-
-Stream sessions are in-memory. If a joiner crashes, the session is lost and a restarted node begins a fresh join.
-
-### 10.6 Settle-Window Assumption
-
-The join and ownership-transition logic relies on membership gossip to disseminate the new node's membership state.
-
-Before calculating and acting on the ownership transition, the rebalancer waits for the configured settle period:
-
-`rebalance_settle_ms`
-
-The intended settle period is approximately three gossip rounds.
-
-The design assumes:
+This relies on the assumption:
 
 `No coordinator is partitioned from gossip for longer than rebalance_settle_ms`
 
-This is an operational assumption, not a consensus guarantee.
+If a coordinator remains partitioned beyond this period, it may continue writing without including the joiner.
 
-If a coordinator remains partitioned from gossip beyond the settle window, it may continue operating with an outdated membership view. In that case, it may not include the joining node in its write paths during part of the join.
+The settle window reduces stale membership views but is not a consensus protocol.
 
-Such missed writes are expected to be repaired through subsequent cleanup's `have_many` confirmation process and read repair, provided that a sufficiently new copy still exists on a reachable replica.
+### 7.3 Incomplete Join
 
-The settle window reduces the probability of this condition but cannot eliminate it under arbitrary network partitions.
+A joiner retries unavailable sources with backoff.
 
-### 10.7 Incomplete Synchronization and `join_max_wait_ms`
+If synchronization cannot finish within `join_max_wait_ms`, the node may transition to `ALIVE` with incomplete historical data.
 
-A joining node normally remains `JOINING` while it pulls its required historical data.
+This favors availability over indefinite blocking.
 
-However, a source may be unavailable, a network connection may repeatedly fail, or every candidate source for a range may be unreachable.
+Incomplete synchronization is logged as an error. Read repair and a subsequent `CLUSTER SYNC` can repair missing records when a sufficiently new copy survives elsewhere.
 
-The joiner retries source selection and transfer with backoff.
+`ALIVE` does not necessarily mean that every historical record has been synchronized.
 
-If synchronization remains incomplete after `join_max_wait_ms`, the node is allowed to transition to `ALIVE` with gaps.
+### 7.4 Graceful Leave: Push-Based Handoff
 
-This is an explicit availability trade-off:
+A graceful departure uses the `LEAVING` state.
 
-- Keeping the node in `JOINING` indefinitely would delay its normal activation.
-- Allowing it to become `ALIVE` makes it available to the cluster but does not prove that its historical dataset is complete.
-- The incomplete synchronization is logged as an error.
-- Read repair can repair keys that are subsequently read.
-- `CLUSTER SYNC` can be used to retry historical catch-up.
+The process:
 
-Therefore:
+1. The node receives `CLUSTER LEAVE`.
+2. It transitions to `LEAVING`.
+3. The future ring is calculated as `ring_after`, excluding the leaving node.
+4. Writes are sent to both normal preference-list owners and future owners.
+5. Additional writes to future owners are best-effort and do not count toward `W`.
+6. The leaving node scans its local records.
+7. It transfers records to the future owners.
+8. Future owners apply records using normal version comparison.
+9. The node completes the handoff and transitions to `LEFT`.
+10. `LEFT` propagates through gossip and the node leaves the active ring.
 
-`ALIVE` does not necessarily mean that every historical record has been synchronized if the join wait limit was reached.
+If handoff fails or times out, the node reverts to `ALIVE` with a bumped incarnation.
 
-The system favors continued availability over indefinite blocking of node activation.
+The node must not be considered successfully departed while required handoff work remains unresolved.
 
-### 10.8 Failure-Mode Table
+### 7.5 Cleanup and Ownership Confirmation
 
-| Situation | What happens |
+After ownership changes, old owners may retain records that no longer belong to them.
+
+Cleanup must not delete a record merely because a transfer was attempted.
+
+The old owner:
+
+1. Identifies records it no longer owns.
+2. Determines the current owners for each key.
+3. Checks that every required owner has a version greater than or equal to its local version.
+4. Deletes the obsolete copy only after all confirmations succeed.
+5. Retains the record and retries if any owner is unreachable or has an older version.
+
+Cleanup runs at a controlled interval using `cleanup_interval_ms`.
+
+Expired records are transferred as bare tombstones.
+
+### 7.6 Administrative Commands
+
+| Command | Purpose |
 |---|---|
-| Source dies mid-pull | The joiner switches those ranges to the next candidate source. |
-| Every source unreachable | Retries with backoff until `join_max_wait_ms`, then goes `ALIVE` with gaps (logged as an error); read repair and `CLUSTER SYNC` heal. |
-| Joiner crashes mid-pull | Detector marks it `SUSPECT` then `DEAD`; a restart is a fresh join with a newer incarnation. |
-| Leaver crashes mid-drain | Stays `LEAVING` (peers keep double-writing); restart it or run `CLUSTER FORGET <id>`. |
-| Leave handoff fails or times out | Reverts to `ALIVE` with a bumped incarnation; safe to retry. |
-| Owner unreachable during cleanup | Record is kept; retried every `cleanup_interval_ms`. |
-| Dead node permanently removed | Run `CLUSTER FORGET <id>`; then run `CLUSTER SYNC` on the survivors to restore N copies. |
-| Coordinator unaware of a joiner for longer than the settle time | Rare writes may be missed by the joiner; healed by cleanup's `have_many` check and read repair, provided a sufficiently new surviving copy remains available. |
+| `CLUSTER NODES` | Inspect known nodes, states, addresses and incarnations |
+| `CLUSTER LEAVE` | Start graceful departure of the local node |
+| `CLUSTER FORGET <id>` | Explicitly remove an eligible permanently dead or leaving node |
+| `CLUSTER SYNC` | Synchronize historical data and restore replica ownership |
 
-### 10.9 Administrative Cluster Commands
+`CLUSTER FORGET` changes membership and ring ownership. It does not automatically restore the desired number of copies.
 
-Phase 6 exposes explicit commands for inspecting and managing membership and synchronization.
+Run `CLUSTER SYNC` on surviving nodes after a permanent removal.
 
-`CLUSTER NODES`
+### 7.7 Rebalancing Failure Cases
 
-Returns known nodes and their membership information, including node ID, address, state, and incarnation. The local node is identified with `myself`.
+| Situation | Behavior |
+|---|---|
+| Source fails during join | Joiner tries another source |
+| All sources unavailable | Retries until the configured wait limit |
+| Joiner crashes | Restart begins a fresh synchronization session |
+| Leaver crashes mid-drain | Peers retain the transition state; restart it or use administrative recovery |
+| Leave handoff fails | Node returns to `ALIVE` with a newer incarnation |
+| Owner unreachable during cleanup | Record is retained |
+| Permanently dead node forgotten | Survivors require `CLUSTER SYNC` |
+| Coordinator misses a join beyond settle window | Some join writes may be missed; later repair requires a surviving newer copy |
 
-`CLUSTER LEAVE`
+Synchronization sessions are in-memory. A restarted joiner starts a fresh join.
 
-Starts graceful departure for the local node. The node performs its handoff and transitions to `LEFT` after completing the operation.
+## 8. Time: Two Time Axes, HLC and Garbage Collection
 
-`CLUSTER FORGET <id>`
+The system uses two different notions of time. They must never be mixed.
 
-Explicitly forgets a permanently dead or leaving node.
+### 8.1 Physical Wall-Clock Time
 
-The command is restricted to eligible membership states and cannot be used to remove the local node.
+Physical time is measured in Unix milliseconds.
 
-Forgetting a node changes membership and ring ownership, but does not automatically restore the desired number of data copies.
+It is used for:
 
-`CLUSTER SYNC`
+- TTL expiration deadlines.
+- Tombstone garbage-collection deadlines.
+- Membership incarnation initialization.
+- Clock-skew validation.
 
-Starts catch-up synchronization on the local node. It is used to repair incomplete joins and to restore replicas after a node has been permanently removed.
+An expiration deadline is an absolute physical timestamp.
 
-The command returns the number of records processed by the synchronization operation.
+### 8.2 Hybrid Logical Clock
 
-### 10.10 Rebalancing and Data Safety
+Record versions use HLC integers, not raw wall-clock milliseconds.
 
-Rebalancing does not make the in-memory cache durable.
+The timestamp layout is:
 
-The following limitations remain:
+`hlc_timestamp = (physical_time_ms << 16) | logical_counter`
 
-- A process restart can lose local records and in-memory stream sessions.
-- A joiner that reaches `ALIVE` after `join_max_wait_ms` may still have missing historical records.
-- A source that becomes unavailable can delay synchronization until another source is available.
-- Cleanup cannot safely remove a record when an owner cannot confirm possession of a sufficiently new version.
-- A forced forget changes the ownership topology but requires a subsequent synchronization operation to restore the desired number of copies.
-- The settle-window assumption cannot guarantee correct behavior under arbitrary network partitions.
-- LWW continues to resolve conflicting records by version ordering rather than preserving concurrent values.
-- HLC improves timestamp ordering but does not provide a global clock or remove the need for reasonably synchronized physical clocks.
-- The system does not provide disk durability or exactly-once operation execution.
+The upper bits contain physical milliseconds. The lower 16 bits contain a logical counter.
 
-### 10.11 Phase 6 Conclusion
+`hlc_ms()` extracts the physical millisecond component.
 
-Phase 6 introduces explicit data movement when cluster ownership changes.
+The complete version is:
 
-A joining or restarted node pulls historical data from existing replicas while continuing to receive writes. A leaving node double-writes to future owners and transfers its existing records before becoming `LEFT`. Cleanup removes obsolete copies only after the current owners confirm that they hold sufficiently new versions.
+`(hlc_timestamp, node_id)`
 
-The protocol is designed to keep client traffic available during membership changes while avoiding premature deletion of data.
+The node ID is a deterministic tie-breaker.
 
-The settle-window assumption and bounded join wait make the availability trade-off explicit. A node can become `ALIVE` with incomplete synchronization when the configured wait limit is reached, but the missing data can subsequently be repaired through read repair and `CLUSTER SYNC`.
+### 8.3 HLC Generation
 
-The implementation remains an in-memory, eventually consistent distributed cache rather than a durable storage system.
+Conceptually, the next timestamp advances beyond the previous local timestamp while incorporating current physical time:
 
-## 11. HLC Clock-Skew Validation
+`next_timestamp = max(current_hlc, previous_hlc + 1)`
 
-The HLC implementation is tested using both deterministic tests and a manual multi-node clock-skew experiment.
+This ensures that a coordinator's generated timestamps remain monotonic even when multiple writes occur during the same physical millisecond.
 
-### 11.1 Deterministic Tests
+### 8.4 Observing Remote HLC Timestamps
 
-The clock-skew test suite covers the following scenarios:
+When a node receives a remote record or gossip timestamp:
 
-- A later write through a node with a slower clock still wins after observing a newer HLC timestamp.
-- Gossip allows a node with a slower clock to advance its HLC after receiving a timestamp from another node.
-- A timestamp that is unreasonably far ahead of the receiver's wall clock is rejected rather than adopted.
-- TTL expiration behavior is tested with respect to the configured clock-skew allowance.
+1. It extracts the remote HLC physical component.
+2. It compares it against its local HLC and wall clock.
+3. It accepts and observes the timestamp if it is within the configured drift allowance.
+4. It rejects timestamps too far ahead of local physical time.
+5. Rejections increment `clock_drift_rejects`.
 
-These tests use controllable clocks where appropriate so that clock behavior can be tested without depending on real scheduling or operating-system clock changes.
+The default configuration is:
 
-### 11.2 Manual Clock-Skew Experiment
+`max_clock_skew_ms = 5000`
 
-A three-node cluster can be used to observe HLC propagation with a deliberately shifted physical clock.
+Rejecting a remote HLC timestamp does not necessarily reject the accompanying membership gossip.
 
-Example setup:
+HLC observation communicates logical-clock progress, not proof that all records from the sender have been received.
 
-- Node `n1`: normal system clock, client port 7001, RPC port 8001.
-- Node `n2`: normal system clock, client port 7002, RPC port 8002.
-- Node `n3`: clock shifted approximately two seconds ahead, client port 7003, RPC port 8003.
-- `max_clock_skew_ms`: 5000.
+### 8.5 Clock-Skew Experiment
 
-The shifted node can be started with `faketime`:
+The implementation supports deterministic clock tests and manual multi-node experiments.
 
-```bash
-faketime -f "+2s" python -m node \
-  --config config.example.json \
-  --node-id n3 \
-  --port 7003 \
-  --rpc-port 8003
-```
+A representative three-node setup uses:
 
-A write through the shifted node generates a timestamp based on its future-shifted wall clock. Other nodes can learn about that timestamp through replication or gossip.
+- `n1`: Normal system clock.
+- `n2`: Normal system clock.
+- `n3`: Clock shifted approximately two seconds ahead.
+- `max_clock_skew_ms`: 5,000.
 
-Because the two-second difference is within the configured five-second drift allowance, the receiving nodes should be able to observe the timestamp.
+A two-second future offset should be accepted within the configured allowance. A larger offset can exercise the rejection path.
 
-A larger artificial offset can be used to exercise the rejection path, provided it exceeds the configured maximum drift.
+Useful metrics:
 
-### 11.3 Interpreting HLC Metrics
+| Metric | Meaning |
+|---|---|
+| `clock_drift_rejects` | Remote HLC timestamps rejected for excessive drift |
+| `hlc_lead_ms` | Difference between the latest known HLC physical component and local wall time |
 
-The implementation exposes clock-related information through node metrics, including:
+`hlc_lead_ms` is not a direct measurement of clock skew. A negative value can simply mean that the latest known HLC event is older than the current wall clock.
 
-- `clock_drift_rejects`: Number of remote HLC timestamps rejected because they exceeded the configured drift allowance.
-- `hlc_lead_ms`: Difference between the physical component of the node's latest known HLC timestamp and its current local wall clock.
+### 8.6 TTL and HLC Are Independent
 
-The `hlc_lead_ms` metric must not be interpreted as a direct measurement of clock skew.
+HLC improves version ordering but does not make TTL independent of physical clocks.
 
-It measures the age or lead of the latest known HLC event relative to the local wall clock:
+A record's expiration deadline is created once using wall-clock milliseconds and preserved across all replicas and transfers.
 
-`hlc_lead_ms = hlc_ms(last_hlc_timestamp) - local_wall_clock_ms`
+The two values have different purposes:
 
-For example:
+| Value | Purpose |
+|---|---|
+| HLC integer | Ordering record versions |
+| `expire_at` | Determining when a record expires |
 
-- A positive value can indicate that the latest known HLC timestamp is ahead of the local wall clock.
-- A negative value can indicate that the latest known HLC event is older than the current wall clock.
-- A large negative value immediately after startup can occur before the node has generated or observed any HLC timestamp.
+Wall-clock milliseconds must never be compared directly against a packed HLC integer.
 
-A negative value does not necessarily mean that the node's physical clock is behind another node. It can simply mean that no recent HLC event has occurred.
+### 8.7 Tombstone Garbage Collection
 
-The metric is useful for observing HLC progress, but it is not a substitute for comparing physical clocks directly.
+Garbage collection must retain deletion metadata long enough to prevent stale values from being resurrected.
 
-### 11.4 Clock-Skew Limitations
+The configuration must satisfy:
 
-The manual experiment and deterministic tests validate the intended HLC behavior under controlled clock differences.
+`hint_ttl_ms <= tombstone_grace_ms`
 
-They do not prove correctness under every possible clock failure.
+and:
 
-The implementation still assumes:
+`tombstone_grace_ms >= 2 * max_clock_skew_ms`
 
-- Physical clocks remain within a reasonable range of one another.
-- The configured `max_clock_skew_ms` reflects the expected deployment environment.
-- Nodes with severely incorrect clocks are corrected or restarted rather than allowed to continually generate unusable timestamps.
-- Absolute TTL expiration remains subject to physical clock differences.
+The grace period must also exceed the supported hint lifetime and account for expected replica downtime.
 
-HLC reduces the impact of ordinary clock skew on version ordering. It does not make the system independent of physical time.
+A node returning after a downtime beyond the supported grace period must be wiped and fully resynchronized before becoming an owner.
 
+## 9. Eviction: Pinning, Soft Cap and Accounting
 
-## 12. Verification
+Each node can enforce an approximate local store-memory budget using LRU or LFU eviction.
 
-Verification is designed to distinguish defects from behavior that is expected under an eventually consistent, leaderless system. The test harness therefore uses an explicit oracle, separates strict correctness scenarios from informational consistency experiments, and reports stale reads separately from lost writes.
+A memory limit of zero means unlimited store memory.
 
-### 12.1 Test Oracle and Worker-Owned Keys
+### 9.1 Memory Accounting
 
-The load generator assigns each worker its own keyspace. A worker writes and reads only keys in that worker's namespace during the concurrent workload.
-
-This ownership rule is important: it prevents two independent workers from racing to update the same key and makes the expected value for a key unambiguous. Without worker-owned keys, a test could incorrectly label a valid concurrent Last-Write-Wins outcome as data corruption.
-
-The oracle tracks the expected state for keys whose operation outcome is known:
-
-- A write that receives a successful acknowledgement updates the oracle's expected value for that key.
-- A request that fails definitively without being applied does not become an acknowledged expected write.
-- A request whose outcome is ambiguous—for example, the client times out after sending it—must not be treated as definitely failed or definitely committed. The key is marked `UNCERTAIN`.
-
-`UNCERTAIN` is an oracle state, not a value stored by the cache. It means the test cannot safely decide whether the operation took effect: the server may have committed the write even though the acknowledgement did not reach the client.
-
-The harness reports uncertain outcomes separately and excludes them from assertions that require a known expected value. It must not count an uncertain request as an acknowledged write that was lost. This avoids false failures caused by the unavoidable ambiguity between server-side execution and client-side acknowledgement.
-
-The oracle is intentionally conservative. It verifies what the client can prove from acknowledgements and later observations; it does not claim exactly-once execution or infer a definitive outcome from a timeout alone.
-
-### 12.2 TTL-Aware Oracle Checks
-
-TTL values use absolute `expire_at` timestamps in Unix milliseconds. Replication and repair must preserve that original deadline; copying a record must not restart its relative TTL.
-
-The oracle must account for the fact that a read close to an expiration deadline can race with request scheduling, network delay, and physical-clock differences. It therefore uses a configurable TTL safety margin around the deadline rather than treating a read at the exact boundary as a definitive correctness result.
-
-For a record with expiration deadline `expire_at` and configured safety margin `TTL_MARGIN_MS`:
-
-- Clearly live: verify the value only while the observation time is earlier than `expire_at - TTL_MARGIN_MS`.
-- Boundary window: observations from `expire_at - TTL_MARGIN_MS` through `expire_at + TTL_MARGIN_MS` are treated as ambiguous for the oracle. They are not used to declare a stale value or an expiration failure.
-- Clearly expired: verify that the value is no longer visible only after the observation time is later than `expire_at + TTL_MARGIN_MS`.
-
-The margin is a test-harness tolerance, not an extension of the record's TTL and not a change to the cache's expiration semantics. It should be selected to cover the test's expected scheduling and clock uncertainty, and the configured value should be recorded with the test configuration. The test must not silently widen the margin after observing a failure.
-
-This boundary treatment is especially important because TTL expiration depends on physical time even though record versions use HLC. HLC ordering does not make absolute expiration independent of clock accuracy.
-
-### 12.3 Strict Scenarios Versus Informational Scenarios
-
-The harness distinguishes scenarios with a deterministic correctness expectation from scenarios that deliberately expose the system's consistency trade-offs.
-
-Strict scenarios are pass/fail tests. They are used when the expected result follows from the configured replication and recovery behavior. A strict scenario should fail when a required request fails, when a known acknowledged value is incorrectly lost, or when a key with a known expected value returns an incorrect value outside the TTL boundary window. Any scenario-specific requirements—such as the required number of surviving copies or successful recovery after healing—must also be checked explicitly.
-
-`isolate_one` is a strict scenario. It isolates one node while the remaining cluster continues serving the workload, then heals the network and checks recovery. Its assertions focus on the scenario's promised behavior: no failed client operations in the measured run, no known acknowledged writes lost, and successful verification after recovery. Retry activity, temporary stale reads, and latency increases are recorded as diagnostic observations; they are not interchangeable with a failed write or a lost acknowledged value.
-
-Informational scenarios are experiments that demonstrate a documented consistency limitation rather than a behavior the implementation promises to prevent. They should complete and report their observations, but expected consistency conflicts must not be converted into a strict correctness failure.
-
-`split_3_2` is informational. During a 3/2 network partition, both sides may accept writes through sloppy quorum and stand-in nodes. The two sides can therefore acknowledge conflicting writes for the same keys. When communication returns, LWW chooses one version; it does not preserve every acknowledged concurrent value. The experiment measures divergence, read-repair progress, explicit synchronization, and which value wins. It is not a promise that every acknowledged write from both sides will survive.
-
-The distinction is deliberate:
-
-- A strict test checks a property the system is designed to guarantee under the test's stated assumptions.
-- An informational test demonstrates an expected limitation or trade-off and records the result without claiming that the limitation has been eliminated.
-
-A successful informational run means the experiment completed and produced interpretable measurements. It does not mean that all writes on both sides of a partition were preserved.
-
-### 12.4 Stale Reads and Lost Writes Are Different Measurements
-
-A stale read occurs when a GET returns a value older than a newer version that exists elsewhere in the cluster or is known to the test oracle. It is an observation about what a reader saw at a particular time.
-
-A stale read can be temporary. It may occur because the read consulted a replica that had not yet received the latest write, because the newest replica was not included in the read fanout, or because repair had not yet completed. Read repair, hinted handoff, or `CLUSTER SYNC` may later bring replicas into agreement.
-
-A lost acknowledged write is different. It means a write that received a successful client acknowledgement is not represented in the final converged state being evaluated. In a partition where both sides acknowledged conflicting values, LWW can select one winner and discard the other version. That losing acknowledged value is no longer present in the final state, even though the write was acknowledged when it occurred.
-
-Therefore:
-
-- A stale read does not by itself prove that a write was lost. The newer value may still exist on another replica and may later be returned after repair.
-- A lost acknowledged write is not merely a temporary read of an old replica. It describes a value that did not survive conflict resolution in the final state.
-- Retry counts, stale-read counts, failed-request counts, and lost-write counts measure different things and must be reported separately.
-
-The partition experiment illustrates this distinction. It observed divergence after healing, fewer divergent keys after a read sweep, and convergence after explicit `CLUSTER SYNC`. The earlier side's acknowledged values that lost the LWW comparison are reported as silently lost writes; they are not the same metric as stale reads observed during the convergence period.
-
-### 12.5 Interpreting the Recorded Partition Experiments
-
-The recorded `isolate_one` run used a five-node cluster and isolated node `n2`. The observed failure-detection time was 7.3 seconds and the heal-to-`ALIVE` time was 1.4 seconds. The run reported zero failed requests, 27 retries, and 5 stale reads. These are measurements from that run, not universal timing or availability guarantees.
-
-The recorded `split_3_2` run was informational. Each side acknowledged 200 writes to the same test keys. After healing, 200 keys were divergent; after a read sweep, 115 remained divergent; after `CLUSTER SYNC`, divergence was zero. The final values were `from-B` for all 200 keys, and 200 acknowledged writes from the losing side were reported as silently lost through LWW conflict resolution.
-
-The combined run reported 59,245 operations, zero failed requests, 11 retries, 62 stale reads, and a worst observed per-interval p99 of 1,057 ms. The load generator verified 4,608 keys with zero incorrect values under its verification rules.
-
-These measurements describe the tested execution only. In particular, zero divergence after `CLUSTER SYNC` demonstrates convergence for this experiment; it is not a proof that every possible partition, concurrent-write pattern, or failure timing will converge without loss.
-
-### 12.6 Verification Reporting Rules
-
-Test reports should keep the following categories separate:
-
-| Measurement | Meaning | How to interpret it |
-|---|---|---|
-| `failed` | Client operations that returned a failure | Availability/request outcome; a failed operation is not automatically a lost acknowledged write. |
-| `retries` | Client retries triggered by transient errors or timeouts | Recovery/transport activity; retries do not imply data loss. |
-| `stale_reads` | Reads that observed an older value than the oracle or a newer known replica version | Temporary consistency visibility issue; may be repaired later. |
-| `UNCERTAIN` | Operations whose commit outcome cannot be determined from the client response | Ambiguous result; do not classify as acknowledged success or definite loss. |
-| `lost` / silently lost acknowledged writes | Acknowledged values absent from the final state after the scenario's convergence procedure | A data-survival/conflict-resolution result, distinct from a stale read. |
-| `divergent` | Keys whose replicas disagree at the measurement point | Temporary replica disagreement; report the stage at which it was measured. |
-| `wrong` | Keys whose observed value violates a known oracle expectation outside the TTL boundary window | A strict verification mismatch. |
-| `p99` | 99th-percentile latency for the reporting interval or measurement window | Latency observation; specify whether it is interval p99 or whole-run p99. |
-
-## 13. Overall Design Limitations
-
-The current system is an educational, in-memory distributed cache implementing important Dynamo-style mechanisms. It is not intended to provide every guarantee of a production database.
-
-The main limitations are:
-
-- No disk persistence or crash-safe recovery.
-- No transactions or general exactly-once execution.
-- No authentication or TLS.
-- Eventual consistency by default.
-- LWW discards losing concurrent updates.
-- HLC depends on reasonably synchronized physical clocks and a configured drift limit.
-- TTL expiration uses absolute physical timestamps.
-- Membership gossip uses full-table exchange and is intended for small clusters.
-- Failure detection can produce false suspicions under slow or partitioned networks.
-- Incarnation numbers are not persisted across restarts.
-- Hints and synchronization sessions are in-memory.
-- Sloppy-quorum acknowledgements do not guarantee visibility through the original preference list.
-- Read repair only repairs keys that are read.
-- A joining node can become `ALIVE` with incomplete historical data after its configured wait limit.
-- The settle window reduces stale membership views but is not a consensus protocol.
-- Cleanup requires owner confirmation and can be delayed when owners are unreachable.
-
----
-
-*A test report must identify the scenario, configuration, observation stage, and whether the scenario is strict or informational. It must not describe an informational consistency trade-off as a strict pass/fail guarantee, and it must not combine stale reads with lost acknowledged writes into a single error count.*
-
-*This document describes the current design and intended behavior of SelfHeal Cache. Features are implemented incrementally, and the documented guarantees are limited by the implementation and the failure assumptions described above. Benchmarks and tests provide evidence for specific tested scenarios; they do not establish universal performance or correctness guarantees.*
-
-
-## 14. Eviction and Memory Accounting
-
-Each node can enforce an approximate store-memory budget using either LRU or LFU eviction. A configured memory limit of zero means unlimited store memory. The accounting charge for a record is:
+The accounting charge per record is:
 
 `len(key) + len(value) + OVERHEAD`
 
-The calibrated `OVERHEAD` is 261 bytes per record. A `tracemalloc` calibration with 100,000 records measured approximately 283, 372, and 1,272 traced bytes per record for 10-byte, 100-byte, and 1,000-byte values respectively; the final accounted values were 282, 372, and 1,272 bytes. This close match is specific to those record shapes. `tracemalloc` is not process RSS and does not include every source of process or container memory use. The configured cap is an approximate store budget, not a hard process-memory limit.
+The calibrated overhead is 261 bytes per record.
 
-### 14.1 Policy behavior
+A `tracemalloc` calibration using 100,000 records measured:
 
-- LRU evicts the least recently used eligible key. Its ordering is maintained with an ordered structure so access/touch and removal are constant-time operations.
-- LFU evicts the least frequently used eligible key. Frequency counters saturate at 255, ties fall back to recency, and periodic aging halves counters so old popularity does not remain permanent.
-- Only live values are ordinary eviction candidates. Tombstones and expired records still inside their grace period remain pinned so that a stale replica cannot resurrect a deleted or expired key.
-- If memory pressure requires reclaiming an expired value, its payload can be dropped while retaining its version as a bare tombstone. Pinned records can therefore keep the store above its configured budget; this is a soft cap, and `evict_blocked` records that condition.
-- Eviction is local. It does not write a tombstone, trigger re-replication, or create hints. A key evicted on one node can still be served by another replica and may be refilled by read repair.
-- Only client-serving reads refresh recency. Internal streaming, handoff, and repair traffic do not touch the policy state, avoiding policy pollution.
+| Value size | Traced bytes/record | Accounted bytes/record |
+|---|---:|---:|
+| 10 bytes | ~283 | 282 |
+| 100 bytes | ~372 | 372 |
+| 1,000 bytes | ~1,272 | 1,272 |
 
-### 14.2 Eviction interactions
+These measurements are specific to the tested record shapes.
 
-| Interaction | Behavior |
-|---|---|
-| Evicted key still exists on another replica | A read consulting that replica can still return the value; read repair may refill the evicting node, subject to its cap. |
-| Delete / tombstone | Tombstones are pinned, preventing eviction from enabling resurrection. |
-| Rebalancing | A capped joiner can receive its assigned data and then evict what does not fit locally. |
-| Hints | Hints are a separate in-memory structure and are not included in the record-store cap. |
-| Quorum mode | Eviction can remove a copy after an acknowledged write and therefore voids the normal quorum-overlap freshness argument. The documented quorum read-after-write condition is qualified to a stable ring with eviction disabled. |
+`tracemalloc` is not process RSS and does not account for every source of container or process memory. The configured cap is an approximate store budget, not a hard process-memory limit.
 
-The eviction simulation measured higher LFU hit rates than LRU at all five tested cache capacities on both the Zipf and Zipf-plus-scans traces. Those measurements are workload-specific; they do not imply LFU is universally preferable.
+### 9.2 LRU
 
-## 15. Tunable Consistency Modes
+LRU evicts the least recently used eligible key.
 
-Consistency mode is a cluster-wide configuration setting. `eventual` remains the default. `quorum` enables strict preference-list read and write quorums. For the configured replica count `N`, startup validation requires:
+An ordered structure maintains recency, allowing access/touch and removal operations in constant time.
+
+### 9.3 LFU
+
+LFU evicts the least frequently used eligible key.
+
+- Frequency counters saturate at 255.
+- Ties fall back to recency.
+- Periodic aging halves counters so historical popularity does not remain permanent.
+
+The eviction simulation measured higher LFU hit rates than LRU at all five tested cache capacities on both Zipf and Zipf-plus-scans workloads.
+
+These results are workload-specific, not proof that LFU is universally better.
+
+### 9.4 Pinning and Tombstones
+
+Only live values are ordinary eviction candidates.
+
+The following records are pinned:
+
+- Tombstones.
+- Expired records still inside their grace period.
+
+This prevents eviction from removing deletion metadata and enabling stale-data resurrection.
+
+If memory pressure requires reclaiming an expired value's payload, the payload can be dropped while retaining its version as a bare tombstone.
+
+Pinned records can therefore keep the store above its configured cap.
+
+This is intentional: data-safety metadata takes priority over the soft memory limit.
+
+### 9.5 Eviction Behavior
+
+- Eviction is local to each node.
+- Eviction does not create a tombstone.
+- Eviction does not trigger replication or hinted handoff.
+- Another replica may still serve the value.
+- Read repair may refill an evicted copy, subject to the local cap.
+- Hints are stored separately and are not included in the record-store cap.
+- Only client-serving reads refresh recency.
+- Internal streaming, handoff and repair traffic do not pollute eviction statistics.
+
+The `evict_blocked` metric records situations where pinned records prevent the store from meeting its configured cap.
+
+## 10. Consistency Modes: Eventual vs Quorum
+
+Consistency is configured cluster-wide.
+
+`eventual` is the default mode. `quorum` requires strict preference-list acknowledgements.
+
+For replication factor `N`, read quorum `R` and write acknowledgements `W`, startup validation requires:
 
 `R + W > N`
 
-where `R` is `read_quorum` and `W` is `write_acks`. The Phase 9 example uses `N=3`, `R=2`, and `W=2`.
+The Phase 9 example uses:
 
-| Behavior | `eventual` (default) | `quorum` |
+`N = 3, R = 2, W = 2`
+
+### 10.1 Consistency Comparison
+
+| Behavior | Eventual (default) | Quorum |
 |---|---|---|
-| Write acknowledgement | Requires W acknowledgements; sloppy stand-ins and hints can satisfy a preference-list slot. | Requires W acknowledgements from the preference list only; no stand-ins or hints count. |
-| Read success | Any configured read-fanout response can be sufficient, provided at least one replica answers. | Requires R replica answers; otherwise the read fails. |
-| Stale replica found | Repair is scheduled in the background. | Stale replicas in the read response are repaired before the read replies. |
-| Partition behavior | Reachable replicas can continue accepting writes and diverge. | An operation succeeds only when its key's required replica quorum is reachable. |
-| Main consistency property | Eventual convergence through repair and synchronization, with possible stale reads. | With a stable ring, eviction disabled, and overlapping quorums, a read after an acknowledged write sees that write or a newer version. |
+| Write acknowledgement | W acknowledgements; stand-ins and hints can count | W acknowledgements from preference-list replicas only |
+| Read success | Any configured read-fanout response can be sufficient, with at least one successful response | Requires R replica responses |
+| Stale replica found | Repair scheduled in the background | Stale replicas in the read response are repaired before replying |
+| Partition behavior | Reachable replicas can continue accepting writes and diverge | Operations fail when the required per-key quorum is unavailable |
+| Main guarantee | Eventual convergence through repair and synchronization, with possible stale reads | Overlapping read/write quorums provide conditional read-after-write visibility |
 
-Quorum availability is per key. In a 3-vs-2 node partition with three replicas per key, a key's replica set can fall 3+0 or 2+1 across the two sides. Exactly one side has the full 2-of-3 quorum for that key. It is therefore inaccurate to say that the entire minority side always refuses every key or that the majority side can serve every key.
+### 10.2 Quorum Overlap
 
-### 15.1 What quorum mode does not guarantee
+For a key with `N` replicas:
 
-Quorum mode is not linearizability and should not be called general strong consistency. It does not implement compare-and-set, atomic cluster-wide `SET NX/XX`, atomic `EXPIRE`, transactions, or rollback of partially applied writes.
+`R + W > N`
 
-A write can be applied to some replicas and still fail at the client because fewer than W acknowledgements arrive. Those partial replica updates are not rolled back. A later-stamped failed write can consequently take part in LWW conflict resolution after the partition heals. Strict quorums prevent two sides from both obtaining conflicting full acknowledgements for the same key under the configured overlap; they do not make failed writes transactional.
+means that the read and write acknowledgement sets must overlap when both are drawn from the same preference list.
 
-Synchronous repair in quorum reads narrows the chance that successive reads observe different partial versions, but it does not repair replicas that did not participate in that read. It is not a substitute for consensus or a transaction protocol.
+For example:
 
-### 15.2 CAP positioning
+`N = 3, R = 2, W = 2`
 
-The default mode is availability-oriented (AP-style behavior): reachable replicas can accept operations while partitioned, with divergence resolved later. Quorum mode is CP-leaning on a per-key basis: operations that cannot reach the required quorum fail rather than using sloppy stand-ins. This trades availability for the configured quorum condition; it does not turn the cache into a linearizable database.
+A successful write is acknowledged by at least two replicas. A successful read consults at least two replicas.
 
+At least one replica must belong to both sets.
+
+Because records are versioned, that overlapping replica provides the acknowledged write or a newer version to the read.
+
+### 10.3 Important Qualification: Sloppy Quorum
+
+The overlap argument applies only when acknowledgement sets are drawn from the same preference list.
+
+In eventual mode, a stand-in outside the preference list can store a hint and satisfy a write slot.
+
+A later read over the original preference list is not guaranteed to consult that stand-in.
+
+Hint replay and read repair help close this temporary visibility gap.
+
+Quorum mode therefore does not count stand-ins or hints toward its strict write acknowledgement requirement.
+
+### 10.4 Quorum Limitations
+
+Quorum mode is not linearizable.
+
+It does not provide:
+
+- Compare-and-set.
+- Atomic cluster-wide `SET NX` or `SET XX`.
+- Atomic `EXPIRE`, `PEXPIRE` or `PERSIST`.
+- Transactions.
+- Rollback of partially applied writes.
+
+A write may reach some replicas and still fail at the client because fewer than W acknowledgements arrive.
+
+Those partial writes are not rolled back and can later participate in LWW conflict resolution.
+
+A failed write can therefore resurface after a partition heals.
+
+Synchronous repair during quorum reads narrows temporary disagreement but does not replace consensus.
+
+### 10.5 Per-Key Partition Availability
+
+Quorum availability is determined by the placement of each key's replicas, not simply by whether a node belongs to the majority or minority side of a partition.
+
+In a 3-vs-2 node partition with three replicas per key, a key's replicas may be distributed 3+0 or 2+1 across the two sides.
+
+Only the side holding the required number of replicas can serve that key in quorum mode.
+
+It is therefore inaccurate to claim that the entire minority side always refuses every key or that the majority side can serve every key.
+
+### 10.6 CAP Positioning
+
+- Eventual mode is availability-oriented (AP-style): reachable replicas can accept operations during partitions, with divergence resolved later.
+- Quorum mode is CP-leaning on a per-key basis: operations that cannot reach the required quorum fail rather than using sloppy stand-ins.
+
+Neither mode makes the system a linearizable database.
+
+### 10.7 Eviction and Quorum
+
+Eviction can remove a replica copy after a successful write.
+
+This invalidates the normal quorum-overlap freshness argument because the overlapping copy may no longer exist.
+
+The documented quorum read-after-write condition therefore assumes:
+
+- Stable ring ownership.
+- Eviction disabled.
+- Strict preference-list quorums.
+- The configured overlap condition.
+
+## 11. Verification: Oracle and Test Scenarios
+
+Verification distinguishes implementation defects from expected eventual-consistency behavior.
+
+The test suite combines:
+
+- Unit tests.
+- In-process integration clusters.
+- Injected clocks and skewed-clock tests.
+- Docker-based multi-node chaos testing.
+- Load generation and correctness verification.
+
+### 11.1 Oracle Design
+
+Each load-generator worker owns a separate keyspace.
+
+This prevents independent workers from racing to write the same keys and makes expected values unambiguous.
+
+The oracle tracks operations whose outcomes are known.
+
+- A successful write acknowledgement updates the expected value.
+- A definitive failed request does not become an acknowledged expected write.
+- A request with an ambiguous outcome is marked `UNCERTAIN`.
+
+`UNCERTAIN` means the server may have processed the operation even though the client did not receive a definite response.
+
+Such requests must not be classified as definitely committed or definitely failed.
+
+The oracle excludes uncertain outcomes from assertions requiring a known expected value.
+
+It does not claim exactly-once execution.
+
+### 11.2 TTL-Aware Verification
+
+The oracle uses a configurable TTL safety margin.
+
+For deadline `expire_at` and margin `TTL_MARGIN_MS`:
+
+| Observation | Verification |
+|---|---|
+| Before `expire_at - TTL_MARGIN_MS` | Value must still be live |
+| Between `expire_at - TTL_MARGIN_MS` and `expire_at + TTL_MARGIN_MS` | Boundary is ambiguous |
+| After `expire_at + TTL_MARGIN_MS` | Value must no longer be visible |
+
+The margin accounts for scheduling and clock uncertainty.
+
+It is a test tolerance, not an extension of the actual TTL.
+
+### 11.3 Strict Scenarios
+
+Strict scenarios have deterministic correctness expectations under stated assumptions.
+
+They should fail when:
+
+- A required client operation fails.
+- A known acknowledged value is incorrectly lost.
+- A known expected value is wrong outside the TTL boundary window.
+- Required recovery or replica-count conditions are not satisfied.
+
+`isolate_one` is a strict scenario.
+
+It isolates one node while the remaining cluster continues serving traffic, heals the network and verifies recovery.
+
+Its correctness checks include:
+
+- No failed client operations in the measured run.
+- No known acknowledged writes lost.
+- Successful final verification.
+
+Retries, temporary stale reads and latency increases are recorded separately.
+
+### 11.4 Informational Scenarios
+
+Informational scenarios demonstrate expected consistency trade-offs rather than behavior the implementation promises to prevent.
+
+`split_3_2` is informational.
+
+Both partition sides may accept writes using sloppy quorum and stand-in nodes. When communication returns, LWW chooses one winning version for conflicting keys.
+
+The experiment measures:
+
+- Replica divergence.
+- Read-repair progress.
+- Explicit synchronization.
+- Final conflict-resolution outcomes.
+
+It does not promise that every acknowledged concurrent write on both sides survives.
+
+### 11.5 Stale Reads vs Lost Acknowledged Writes
+
+These measurements must never be combined.
+
+| Measurement | Meaning |
+|---|---|
+| `failed` | Client operations that returned failure |
+| `retries` | Client retry attempts |
+| `stale_reads` | Reads that observed an older value than the oracle or another known replica |
+| `UNCERTAIN` | Operations with unknown commit outcome |
+| `lost` | Acknowledged writes absent from the final evaluated state |
+| `divergent` | Keys whose replicas disagree at the observation point |
+| `wrong` | Values that violate a known oracle expectation outside the TTL boundary |
+| `p99` | 99th-percentile latency for the stated measurement window |
+
+A stale read can be temporary and repaired later.
+
+A lost acknowledged write is a value that did not survive the final convergence procedure.
+
+A failed request is not automatically a lost acknowledged write.
+
+### 11.6 Recorded Partition Experiments
+
+The recorded `isolate_one` experiment used five nodes and isolated `n2`.
+
+| Measurement | Result |
+|---|---:|
+| Failure detection | 7.3 seconds |
+| Heal-to-ALIVE | 1.4 seconds |
+| Failed requests | 0 |
+| Retries | 27 |
+| Stale reads | 5 |
+
+These are measurements from that execution, not universal guarantees.
+
+The informational `split_3_2` experiment produced:
+
+| Stage | Divergent keys |
+|---|---:|
+| After healing | 200 |
+| After read sweep | 115 |
+| After `CLUSTER SYNC` | 0 |
+
+Each side acknowledged 200 writes to the same test keys. The final value was `from-B` for all 200 keys, with 200 acknowledged writes from the losing side reported as silently lost through LWW conflict resolution.
+
+The combined run recorded:
+
+| Measurement | Result |
+|---|---:|
+| Operations | 59,245 |
+| Failed requests | 0 |
+| Retries | 11 |
+| Stale reads | 62 |
+| Worst observed interval p99 | 1,057 ms |
+| Verified keys | 4,608 |
+| Incorrect final values | 0 |
+
+These results demonstrate convergence in the tested experiment. They do not prove that every possible partition or concurrent-write pattern will converge without loss.
+
+## 12. Invariants
+
+The following invariants define the safety rules that the implementation and tests must preserve.
+
+1. **Ring ownership:** The ring changes only on first sight of a node or when a node reaches `LEFT`. Liveness changes such as `SUSPECT` and `DEAD` never independently change ownership.
+
+2. **TTL creation:** `expire_at` is created only by the coordinator's command handler. Replication, repair and rebalancing preserve the original deadline.
+
+3. **Version separation:** Record versions are HLC integers. Wall-clock milliseconds must never be mixed directly with packed HLC values.
+
+4. **Hint and tombstone retention:**
+   `hint_ttl_ms <= tombstone_grace_ms` and
+   `tombstone_grace_ms >= 2 * max_clock_skew_ms`.
+
+5. **Safe cleanup:** After a ring change, a record can be dropped only when every current owner has confirmed holding that version or a newer one.
+
+6. **Eviction safety:** Tombstones and expired records still within their grace period are never ordinary eviction candidates.
+
+7. **Quorum overlap:** In quorum mode, `read_quorum + write_acks > replicas`.
+
+8. **Membership self-ownership:** A node speaks for itself. Remote claims about its own membership entry never overwrite it; only its own refutation can bump its incarnation.
+
+9. **RPC deadlines:** Every RPC has a timeout. A peer that does not respond must not block a coordinator indefinitely.
+
+10. **Rebalancing fairness:** Rebalancing is rate-limited and yields to the event loop so that background synchronization does not monopolize a node's execution.
+
+These invariants are the core safety properties to check when modifying replication, membership, TTL, eviction or rebalancing code.
+
+## 13. Known Limits
+
+SelfHeal Cache is an educational, in-memory distributed cache. Its mechanisms improve availability and recovery, but the following limitations remain.
+
+### Durability and Recovery
+
+- **No persistence:** A full-cluster restart loses everything. Hints are in-memory, so a stand-in dying before replay loses that write's hint.
+- **Synchronization sessions are in-memory:** A restarted joiner must start a fresh synchronization process.
+- **No crash-safe recovery:** Data is not backed by a write-ahead log or durable storage.
+
+### Consistency
+
+- **LWW loses truly concurrent writes:** Causally ordered writes are handled through HLC ordering, but concurrent writes are resolved arbitrarily by version ordering.
+- **No anti-entropy:** After a partition, replicas that are never read can remain divergent. Read repair is demand-driven; explicit `CLUSTER SYNC` provides historical synchronization. The Day 33 partition experiment is documented in `PARTITIONS.md`.
+- **Non-atomic operations:** `SET NX`, `SET XX`, `EXPIRE`, `PEXPIRE` and `PERSIST` use read-modify-write behavior and are not atomic cluster-wide.
+- **Quorum is not linearizable:** Failed quorum writes are not rolled back and can resurface later.
+- **Eviction voids quorum overlap:** The read-after-write overlap argument assumes eviction is disabled.
+- **Sloppy-quorum visibility gap:** A write acknowledged through a stand-in may not immediately be visible through the original preference list.
+
+### Membership and Rebalancing
+
+- **Join-window assumptions:** A coordinator partitioned from gossip for longer than `rebalance_settle_ms` can write without including the joiner.
+- **Incomplete joins:** A node can become `ALIVE` after `join_max_wait_ms` with incomplete historical data.
+- **Full-table gossip:** Suitable for roughly 50 nodes; larger clusters need piggybacked membership deltas.
+- **Imperfect failure detection:** A slow node can be suspected or declared dead even when it has not crashed.
+- **Incarnation uses wall clock:** A manual clock rewind across a restart is unsupported because incarnation persistence is not implemented.
+- **Cleanup can be delayed:** An unreachable owner cannot confirm its version, so obsolete records must be retained.
+
+### Performance and Resource Management
+
+- **Single-threaded asyncio per node:** One large scan or slow handler can delay that node's traffic. Scans and background work are chunked and paced, but the effect is not eliminated.
+- **Approximate memory cap:** The eviction budget is not a hard process RSS limit.
+- **JSON/base64 RPC overhead:** Encoding large values costs approximately 33% in payload overhead. MessagePack could reduce this cost.
+- **No WAN measurements:** Network latency, clock differences and failure behavior across geographically distributed machines have not been established.
+
+### Security and Deployment
+
+- **Trusted network:** There is no authentication, authorization or TLS.
+- **Single-host testing:** Docker containers share a host clock and have near-zero network latency compared with a real distributed deployment.
+- **No production guarantee:** Passing the included tests demonstrates behavior under their specific configurations and failure scenarios, not universal correctness.
+
+## 14. Decision Log
+
+The following decisions summarize the architecture and implementation choices. They record the final design rather than the chronological development process.
+
+| # | Decision | Rationale |
+|---:|---|---|
+| 1 | Use Python 3.12 and `asyncio` | Keep the implementation focused on distributed-systems behavior without introducing unnecessary infrastructure. |
+| 2 | Use a leaderless, Dynamo-style architecture | Any node can coordinate requests; no permanent primary is required. |
+| 3 | Keep RESP and internal RPC on separate interfaces | Preserve Redis client compatibility without coupling internal communication to RESP. |
+| 4 | Use length-prefixed JSON for internal RPC | Provide a simple, explicit framing protocol for node communication. |
+| 5 | Use MD5 for deterministic 64-bit ring positions | Provide stable non-cryptographic hashing. |
+| 6 | Use 150 vnodes per physical node | Balance ownership distribution against ring construction and lookup cost. |
+| 7 | Use stable node IDs and `{node_id}#{i}` token names | Keep ring positions deterministic across restarts. |
+| 8 | Use distinct physical nodes in preference lists | Avoid placing multiple replicas on the same machine. |
+| 9 | Separate liveness from ring ownership | Prevent temporary failures from causing repeated reshuffling. |
+| 10 | Use incarnation and ranked membership states | Resolve gossip updates deterministically and allow self-refutation. |
+| 11 | Use SWIM-style direct and indirect probing | Reduce false suspicions caused by one failed direct probe. |
+| 12 | Use full-table push-pull gossip | Keep membership dissemination simple for small clusters. |
+| 13 | Use HLC integer versions with node-ID tie-breaking | Preserve monotonic logical ordering and deterministic conflict resolution. |
+| 14 | Use absolute TTL deadlines | Preserve expiration semantics through replication, repair and transfer. |
+| 15 | Represent deletion with tombstones | Prevent stale replicas from resurrecting deleted values. |
+| 16 | Coordinate hint lifetime with tombstone grace | Prevent delayed hints from reviving garbage-collected records. |
+| 17 | Use hedged reads and configurable read fanout | Reduce tail latency while consulting multiple replicas. |
+| 18 | Use sloppy quorum and hinted handoff in eventual mode | Keep writes available when preference-list owners are unavailable. |
+| 19 | Bound hint storage and reject new hints when full | Avoid silently discarding existing recovery work. |
+| 20 | Keep read repair demand-driven | Repair stale or missing copies encountered during reads without a full background scan. |
+| 21 | Use pull-based joins | Let joining nodes retrieve historical data from multiple available sources. |
+| 22 | Let joining nodes receive writes but demote them in reads | Avoid losing updates during historical transfer without serving incomplete data as a normal read target. |
+| 23 | Use a settle window before ownership transitions | Allow gossip to disseminate membership changes before rebalancing. |
+| 24 | Double-write to future owners during graceful leave | Deliver current updates while the leaving node drains historical records. |
+| 25 | Require owner confirmation before cleanup deletion | Avoid deleting the last available or newest copy of a record. |
+| 26 | Provide explicit `CLUSTER FORGET` and `CLUSTER SYNC` | Separate administrative membership removal from historical data restoration. |
+| 27 | Use HLC for versions and physical time for TTL | Keep logical ordering separate from absolute expiration. |
+| 28 | Reject excessively future remote HLC timestamps | Prevent badly skewed clocks from pushing other nodes arbitrarily into the future. |
+| 29 | Use pinned tombstones and a soft memory cap | Prioritize deletion safety over strict memory-budget enforcement. |
+| 30 | Support both LRU and LFU | Compare recency-based and frequency-based eviction behavior. |
+| 31 | Add strict preference-list quorum mode | Provide an optional read/write overlap guarantee without sloppy acknowledgements. |
+| 32 | Qualify quorum guarantees when eviction is enabled | A removed replica can invalidate the overlap argument. |
+| 33 | Use worker-owned keyspaces and a conservative oracle | Avoid false correctness failures from concurrent worker writes and ambiguous request outcomes. |
+| 34 | Separate strict and informational chaos scenarios | Distinguish violated guarantees from expected consistency trade-offs. |
+| 35 | Keep stale reads, retries, failures and lost writes as separate metrics | Prevent misleading interpretations of distributed-system test results. |
+| 36 | Rate-limit and yield during background rebalancing | Keep synchronization work from monopolizing the asyncio event loop. |
+
+---
+
+*This document describes the implemented design, its assumptions and its measured behavior. All guarantees are conditional on the stated configuration and failure assumptions. Benchmarks and tests are evidence for specific executions, not universal correctness or performance guarantees.*
