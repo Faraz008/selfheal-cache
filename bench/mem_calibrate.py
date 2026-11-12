@@ -12,7 +12,9 @@ for vlen in (10, 100, 1000):
     real = tracemalloc.get_traced_memory()[0]
     tracemalloc.stop()
     print(
-        f"value={vlen:5d}B  accounted={s.mem / N:7.0f} B/rec  real={real / N:7.0f} B/rec  "
-        f"real/accounted={real / s.mem:4.2f}  suggested OVERHEAD={OVERHEAD + (real - s.mem) / N:.0f}"
+        f"value={vlen:5d}B  accounted={s.mem / N:7.0f} B/rec  "
+        f"real={real / N:7.0f} B/rec  "
+        f"real/accounted={real / s.mem:4.2f}  "
+        f"suggested OVERHEAD={OVERHEAD + (real - s.mem) / N:.0f}"
     )
     del s

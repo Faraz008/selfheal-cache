@@ -186,8 +186,10 @@ async def amain(default_names: list[str]) -> int:
     print("\n=========== SUMMARY ===========")
     for r in h.rows:
         print(
-            f"{'PASS' if r['ok'] else 'FAIL':5} {r['name']:11} failed={r['failed']} lost={r['lost']}"
-            f"retries={r['retries']} stale={r['stale']} p99={r['p99']:.0f}ms {r['extra']}"
+            f"{'PASS' if r['ok'] else 'FAIL':5} "
+            f"{r['name']:11} failed={r['failed']} lost={r['lost']}"
+            f" retries={r['retries']} stale={r['stale']} "
+            f"p99={r['p99']:.0f}ms {r['extra']}"
         )
     failed = [r for r in h.rows if not r["ok"]]
     print("ALL GREEN" if not failed else f"{len(failed)} scenario(s) FAILED")

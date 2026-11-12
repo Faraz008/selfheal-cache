@@ -94,7 +94,7 @@ async def main() -> None:
         for i in range(0, len(keys), 200):
             chunk = keys[i : i + 200]
             got = await asyncio.gather(*(client.get(k) for k in chunk))
-            lost += sum(g != res["acked"][k].encode() for k, g in zip(chunk, got))
+            lost += sum(g != res["acked"][k].encode() for k, g in zip(chunk, got, strict=True))
         lat = sorted(res["lat"])
         print("\n=== RESULT ===")
         print(f"requests={client.stats['requests']}  acked_writes={len(keys)}")

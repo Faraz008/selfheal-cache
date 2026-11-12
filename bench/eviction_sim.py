@@ -1,6 +1,5 @@
 import itertools
 import random
-import time
 from pathlib import Path
 
 import matplotlib
@@ -57,7 +56,7 @@ if __name__ == "__main__":
     traces = {"zipf": zipf_trace(rng), "zipf + scans": scan_trace(rng)}
     fracs = [0.01, 0.02, 0.05, 0.10, 0.20]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
-    for ax, (name, trace) in zip(axes, traces.items()):
+    for ax, (name, trace) in zip(axes, traces.items(), strict=True):
         print(f"\n{name}: hit rate by cache size (fraction of keyspace)")
         print(f"{'size':>6} {'LRU':>8} {'LFU':>8}")
         curves = {"lru": [], "lfu": []}

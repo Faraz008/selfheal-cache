@@ -1,6 +1,5 @@
 import asyncio
 import time
-from collections import Counter
 
 from .common import all_see, host_port, info, raw, sh, wait_for
 from .harness import main, scenario

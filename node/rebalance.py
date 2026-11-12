@@ -283,7 +283,7 @@ class Rebalancer:
                     },
                     timeout=5,
                 )
-                missing = [i for i, h in zip(idxs, have) if not h]
+                missing = [i for i, h in zip(idxs, have, strict=True) if not h]
                 if missing:
                     await self.peers.call(
                         owner,
@@ -304,7 +304,7 @@ class Rebalancer:
 
         await asyncio.gather(*(confirm(o, ix) for o, ix in by_owner.items()))
         dropped = 0
-        for good, (k, rec, _) in zip(ok, batch):
+        for good, (k, rec, _) in zip(ok, batch, strict=True):
             if good and self.store.drop_if_version(k, rec.version):
                 dropped += 1
         self.stats["keys_cleaned"] += dropped

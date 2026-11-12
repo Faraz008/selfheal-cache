@@ -2,12 +2,9 @@ import asyncio
 import time
 from dataclasses import replace
 
-import pytest
-
 from node.config import NodeConfig
 from node.membership import Entry, State
 from node.rpc import RpcError
-from node.server import Server
 
 from .conftest import FAST, eventually, free_port, sees, static_cfgs
 

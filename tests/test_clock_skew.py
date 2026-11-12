@@ -1,5 +1,3 @@
-import asyncio
-
 import pytest
 
 from node.clock import hlc_ms
@@ -11,7 +9,7 @@ from .conftest import SkewClock, connect, eventually, static_cfgs
 async def skewed_cluster(start, offsets_ms: list[int]):
     n = len(offsets_ms)
     cfgs = static_cfgs(n, replicas=n, write_acks=n)
-    return [await start(c, SkewClock(o)) for c, o in zip(cfgs, offsets_ms)]
+    return [await start(c, SkewClock(o)) for c, o in zip(cfgs, offsets_ms, strict=True)]
 
 
 @pytest.mark.parametrize("hlc", [True, False], ids=["hlc-on", "control-no-hlc"])

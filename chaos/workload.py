@@ -74,7 +74,7 @@ class Workload:
     # ---- workers ----
     async def _worker(self, wid: int) -> None:
         rng = random.Random(self.seed * 1000 + wid)
-        names, weights = zip(*self.mix.items())
+        names, weights = zip(*self.mix.items(), strict=True)
         model, seq = self.models[wid], 0
         while not self._stop.is_set():
             await self._gate.wait()
@@ -96,7 +96,6 @@ class Workload:
 
     async def _do(self, op, key, model, rng, tag) -> None:
         t = time.monotonic()
-        ok = True
         try:
             if op == "get":
                 self._check(key, model.get(key), await self.client.get(key))
@@ -113,7 +112,6 @@ class Workload:
                     await self.client.set(key, value)
                     model[key] = (value.encode(), None)
         except (ClusterUnavailable, RespError):
-            ok = False
             self.failed += 1
             if op != "get":
                 model[key] = UNCERTAIN
@@ -155,7 +153,7 @@ class Workload:
             got = await asyncio.gather(
                 *(self.client.get(k) for k, _ in part), return_exceptions=True
             )
-            for (k, e), g in zip(part, got):
+            for (k, e), g in zip(part, got, strict=True):
                 want, known = self._expect(e)
                 if not known:
                     continue
@@ -171,7 +169,7 @@ class Workload:
         return self.ops, self.failed, self.stale, self.client.stats["retries"]
 
     def delta(self, before) -> dict:
-        o, f, s, r = (c - p for c, p in zip(self.snap(), before))
+        o, f, s, r = (c - p for c, p in zip(self.snap(), before, strict=True))
         return {"ops": o, "failed": f, "stale": s, "retries": r}
 
     def mark(self, label: str) -> None:
@@ -189,7 +187,7 @@ class Workload:
             await asyncio.sleep(1)
             lats, self._win = sorted(self._win), []
             cur = self.snap()
-            ops, failed, stale, retries = (c - p for c, p in zip(cur, prev))
+            ops, failed, stale, retries = (c - p for c, p in zip(cur, prev, strict=True))
             prev = cur
             n = len(lats)
             p50 = lats[n // 2] * 1000 if n else 0.0

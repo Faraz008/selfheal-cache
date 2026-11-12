@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import hashlib
 import statistics
 import subprocess
 import sys
@@ -122,11 +121,13 @@ async def main():
         for i in range(0, len(keys), 200):
             chunk = keys[i : i + 200]
             got = await asyncio.gather(*(client.get(k) for k in chunk))
-            lost += sum(g != res["acked"][k].encode() for k, g in zip(chunk, got))
+            lost += sum(g != res["acked"][k].encode() for k, g in zip(chunk, got, strict=True))
         lat = sorted(res["lat"])
         print("\n=== RESULT ===")
         print(
-            f"acked_writes={len(keys)} failed_requests={res['failed']} retries={client.stats['retries']}"
+            f"acked_writes={len(keys)} "
+            f"failed_requests={res['failed']} "
+            f"retries={client.stats['retries']}"
         )
         print(f"lost_acked_writes={lost}")
         print(
